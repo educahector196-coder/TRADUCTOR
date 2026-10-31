@@ -44,9 +44,13 @@
   <h1>🎙️ Traductor en vivo</h1>
   <label>Escuchar
     <select id="fuente">
-      <option value="sistema">🔊 Audio de Teams / video</option>
+      <option value="pc">🔊 Sonido de la PC (sin compartir) — recomendado</option>
+      <option value="sistema">🖥️ Compartir pestaña o pantalla</option>
       <option value="mic">🎙️ Mi micrófono</option>
     </select>
+  </label>
+  <label id="lblDev">Dispositivo
+    <select id="dev" style="max-width:230px"><option value="">(pulsa Iniciar para ver la lista)</option></select>
   </label>
   <label>Idioma que se escucha
     <select id="src"></select>
@@ -66,6 +70,14 @@
   <button id="btnReshare" style="display:none;background:#2d6a4f;border-color:#3ecf8e">🔁 Volver a compartir audio</button>
 </header>
 <div class="warn" id="warn"></div>
+<div id="help" style="display:none;background:#14263f;color:#cfe0ff;padding:12px 16px;font-size:14px;line-height:1.5;border-bottom:1px solid var(--line)">
+  <b>Activar «Mezcla estéreo» en Windows (una sola vez):</b>
+  1) Clic derecho en el ícono del parlante 🔊 (abajo a la derecha) → <i>Configuración de sonido</i> → <i>Más opciones de sonido</i>.
+  2) Pestaña <b>Grabar</b> → clic derecho en un espacio vacío → marca <b>Mostrar dispositivos deshabilitados</b>.
+  3) Clic derecho en <b>Mezcla estéreo</b> → <b>Habilitar</b>. 4) Vuelve aquí, pulsa Detener e Iniciar, y elígela en «Dispositivo» (sale con ⭐).
+  &nbsp;Si no aparece «Mezcla estéreo», instala <b>VB-Cable</b> (gratis, vb-audio.com/Cable) y elige «CABLE Output».
+  <button onclick="this.parentElement.style.display='none'" style="margin-left:8px">Entendido</button>
+</div>
 <div id="meterBox" style="display:none;align-items:center;gap:10px;padding:6px 16px;font-size:12px;color:var(--muted);border-bottom:1px solid var(--line)">
   Audio que llega:
   <div style="flex:0 0 220px;height:8px;background:#222632;border-radius:4px;overflow:hidden"><div id="meterBar" style="height:100%;width:0;background:var(--ok);transition:width .08s"></div></div>
@@ -322,13 +334,57 @@ async function captureSystemAudio(){
   shareStream.getVideoTracks().forEach(v=>v.onended=()=>{ if(running) onShareLost(); });
 }
 let shareLost=false;
+const LOOPBACK=/mezcla est|stereo mix|cable output|vb-audio|voicemeeter|what u hear|loopback|wave out|lo que se oye/i;
+let devStream=null, devRetry=null;
+async function listDevices(){
+  // pedir permiso una vez para poder ver los nombres
+  try{ const t=await navigator.mediaDevices.getUserMedia({audio:true}); t.getTracks().forEach(x=>x.stop()); }catch(e){}
+  const devs=(await navigator.mediaDevices.enumerateDevices()).filter(d=>d.kind==="audioinput");
+  const sel=$("dev"), prev=sel.value||(()=>{try{return localStorage.getItem("tt-dev")}catch(e){return null}})();
+  sel.innerHTML="";
+  for(const d of devs){ if(d.deviceId==="default"||d.deviceId==="communications") continue;
+    sel.add(new Option((LOOPBACK.test(d.label)?"⭐ ":"")+(d.label||"Dispositivo"),d.deviceId)); }
+  const loop=devs.find(d=>LOOPBACK.test(d.label));
+  if(prev && [...sel.options].some(o=>o.value===prev)) sel.value=prev;
+  else if(loop) sel.value=loop.deviceId;
+  return {devs,loop};
+}
+async function captureDevice(){
+  const {loop}=await listDevices();
+  const id=$("dev").value;
+  try{ localStorage.setItem("tt-dev",id); }catch(e){}
+  devStream=await navigator.mediaDevices.getUserMedia({audio:{deviceId:id?{exact:id}:undefined,
+    echoCancellation:false,noiseSuppression:false,autoGainControl:false}});
+  audioTrack=devStream.getAudioTracks()[0];
+  // si el dispositivo se cae, se reconecta solo (sin clics)
+  audioTrack.onended=()=>{ if(running) reconnectDevice(); };
+  return loop;
+}
+function reconnectDevice(){
+  clearTimeout(devRetry);
+  releaseRecTrack(); stopMeter(); audioTrack=null;
+  note("Reconectando el sonido de la PC…");
+  devRetry=setTimeout(async()=>{
+    if(!running) return;
+    try{ await captureDevice(); startMeter(audioTrack); note(""); scheduleRestart(0); }
+    catch(e){ reconnectDevice(); }
+  },1500);
+  scheduleRestart(0);
+}
+function releaseDevice(){ clearTimeout(devRetry); if(devStream){ devStream.getTracks().forEach(t=>{t.onended=null;t.stop();}); devStream=null; } }
 function onShareLost(){
   if(shareLost) return; shareLost=true;
   releaseRecTrack();
   if(shareStream){ shareStream.getTracks().forEach(t=>{ t.onended=null; try{ t.stop(); }catch(e){} }); shareStream=null; }
   audioTrack=null; stopMeter();
-  $("btnReshare").style.display="inline-block";
-  note("El audio compartido se cortó: sigo escuchando por el micrófono. Pulsa «Volver a compartir audio» cuando puedas.");
+  // ¿hay "Mezcla estéreo" o CABLE? entonces seguimos con el sonido de la PC, sin clics
+  captureDevice().then(loop=>{
+    if(loop){ $("fuente").value="pc"; showDev(); shareLost=false; startMeter(audioTrack); note(""); scheduleRestart(0); }
+    else { releaseDevice(); audioTrack=null; throw 0; }
+  }).catch(()=>{
+    $("btnReshare").style.display="inline-block";
+    note("El audio compartido se cortó: sigo escuchando por el micrófono. Pulsa «Volver a compartir audio» cuando puedas.");
+  });
   scheduleRestart(0);
 }
 async function reshare(){
@@ -345,7 +401,19 @@ async function start(){
   try{ localStorage.setItem("tt-langs",JSON.stringify([src.value,dst.value])); }catch(e){}
   $("btnStart").disabled=true; setStatus(false,"Preparando…");
   audioTrack=null;
-  if($("fuente").value==="sistema"){
+  if($("fuente").value==="pc"){
+    try{
+      const loop=await captureDevice();
+      if(!loop && !LOOPBACK.test(audioTrack.label)){
+        setTimeout(()=>note("No encontré «Mezcla estéreo» en tu laptop: estoy usando "+audioTrack.label+". Mira las instrucciones para activarla."),50);
+        $("help").style.display="block";
+      }
+    }catch(e){
+      audioTrack=null;
+      setTimeout(()=>note("No se pudo abrir el sonido de la PC ("+e.name+"): escuchando por el micrófono."),50);
+      $("help").style.display="block";
+    }
+  } else if($("fuente").value==="sistema"){
     try{ await captureSystemAudio(); }
     catch(e){
       // sin audio compartido: arrancamos igual con el micrófono y ofrecemos volver a compartir
@@ -373,6 +441,7 @@ function stop(){
   if(rec){ rec.onend=null; try{ rec.abort(); }catch(e){} }
   releaseRecTrack();
   if(shareStream){ shareStream.getTracks().forEach(t=>t.stop()); shareStream=null; }
+  releaseDevice();
   audioTrack=null; stopMeter(); shareLost=false;
   $("btnReshare").style.display="none"; note("");
   try{ wakeLock&&wakeLock.release(); }catch(e){} wakeLock=null;
@@ -394,8 +463,13 @@ function updateHeaders(){
 }
 updateHeaders();
 [src,dst].forEach(s=>s.onchange=()=>{ updateHeaders(); if(running){ translator=null; setupTranslator(); scheduleRestart(0); } });
-$("fuente").onchange=()=>{ if(!running) return;
-  if($("fuente").value==="sistema") reshare(); else onShareLost(); };
+function showDev(){ $("lblDev").style.display=$("fuente").value==="pc"?"inline":"none"; }
+showDev();
+try{ const f=localStorage.getItem("tt-fuente"); if(f) $("fuente").value=f; showDev(); }catch(e){}
+$("fuente").onchange=()=>{ showDev(); try{ localStorage.setItem("tt-fuente",$("fuente").value); }catch(e){}
+  if(running){ stop(); start(); } };
+$("dev").onchange=()=>{ try{ localStorage.setItem("tt-dev",$("dev").value); }catch(e){} if(running && $("fuente").value==="pc"){ releaseDevice(); reconnectDevice(); } };
+if(navigator.mediaDevices) navigator.mediaDevices.addEventListener?.("devicechange",()=>{ if(running && $("fuente").value==="pc" && (!audioTrack||audioTrack.readyState!=="live")) reconnectDevice(); });
 $("btnSwap").onclick=()=>{ [src.value,dst.value]=[dst.value,src.value]; updateHeaders(); if(running){ translator=null; setupTranslator(); scheduleRestart(0); } };
 
 /* ---------- Botones extra ---------- */
