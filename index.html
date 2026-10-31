@@ -96,7 +96,7 @@ let shareStream=null, audioTrack=null;
 let rec=null, running=false, translator=null, engine="", transcript=[];
 let interimOrigEl=null, interimTradEl=null, interimTimer=null, lastInterim="";
 
-function showWarn(m){ const w=$("warn"); w.textContent=m; w.style.display="block"; }
+function showWarn(m,temp){ const w=$("warn"); w.textContent=m; w.dataset.temp=temp?"1":""; w.style.display="block"; }
 function hideWarn(){ $("warn").style.display="none"; }
 function setStatus(on,txt){ $("dot").classList.toggle("on",on); $("statusTxt").textContent=txt; }
 function now(){ return new Date().toLocaleTimeString("es-PE",{hour:"2-digit",minute:"2-digit",second:"2-digit"}); }
@@ -139,7 +139,15 @@ async function translate(text){
     const j=await (await fetch(u)).json();
     if(j.responseData && j.responseData.translatedText) return j.responseData.translatedText;
   }catch(e){}
-  return "[no se pudo traducir]";
+  return null;
+}
+async function translateRetry(text){
+  for(let i=0;i<3;i++){
+    const t=await translate(text);
+    if(t!==null) return t;
+    await new Promise(r=>setTimeout(r,800*(i+1)));
+  }
+  return "[no se pudo traducir — revisa tu internet]";
 }
 
 /* ---------- Pantalla ---------- */
@@ -172,19 +180,27 @@ async function onFinal(text){
   const time=now();
   addLine("orig",text,time);
   const placeholder=addLine("trad","…",time);
-  const t=await translate(text);
+  const t=await translateRetry(text);
   placeholder.lastChild.textContent=t;
   $("trad").scrollTop=$("trad").scrollHeight;
   transcript.push({time,text,t});
 }
 
 /* ---------- Reconocimiento de voz ---------- */
+let lastActivity=0, restartTimer=null, recTrack=null, failCount=0;
 function startRec(){
+  if(!running) return;
+  // limpiar la instancia anterior
+  if(rec){ rec.onend=rec.onerror=rec.onresult=rec.onstart=rec.onaudiostart=null; try{ rec.abort(); }catch(e){} }
+  if(recTrack){ try{ recTrack.stop(); }catch(e){} recTrack=null; }
   rec=new SR();
   rec.lang=locale(src.value);
   rec.continuous=true;
   rec.interimResults=true;
+  rec.onstart=rec.onaudiostart=()=>{ lastActivity=Date.now(); };
   rec.onresult=e=>{
+    gotResult=true; lastActivity=Date.now(); failCount=0;
+    if($("warn").dataset.temp==="1") hideWarn();
     let interim="";
     for(let i=e.resultIndex;i<e.results.length;i++){
       const r=e.results[i];
@@ -192,35 +208,44 @@ function startRec(){
     }
     if(interim) setInterim(interim);
   };
-  const origOnResult=rec.onresult;
-  rec.onresult=e=>{ gotResult=true; origOnResult(e); };
   rec.onerror=e=>{
     if(e.error==="no-speech"||e.error==="aborted") return;
     if(e.error==="not-allowed"||e.error==="service-not-allowed"){
       showWarn("El navegador bloqueó el reconocimiento de voz (error: "+e.error+"). Si estás en Brave, usa Chrome o Edge. En Chrome: candado de la barra de direcciones → Micrófono → Permitir, y vuelve a iniciar.");
-      stop();
-    }else if(e.error==="audio-capture"){
-      showWarn("No llega audio al reconocimiento (error: audio-capture). Revisa que el micrófono o el audio compartido estén activos.");
-      stop();
-    }else if(e.error==="network"){
-      showWarn("El reconocimiento de voz necesita internet (error: network). Revisa tu conexión.");
-    }else{
-      showWarn("Error del reconocimiento de voz: "+e.error+(e.message?" — "+e.message:""));
+      stop(); return;
     }
+    failCount++;
+    if(e.error==="network") showWarn("Se cortó la conexión del reconocimiento de voz. Reintentando…",true);
+    else showWarn("Error del reconocimiento ("+e.error+"). Reintentando…",true);
   };
-  // Chrome corta la escucha cada cierto tiempo: la reiniciamos sola
-  rec.onend=()=>{ if(running){ try{ go(); }catch(e){ setTimeout(()=>running&&startRec(),300); } } };
-  go();
-}
-function go(){
-  if(audioTrack && audioTrack.readyState==="live"){
-    try{ rec.start(audioTrack); }
-    catch(e){
-      showWarn("Tu navegador no permite transcribir el audio compartido ("+e.name+": "+e.message+"). Actualiza Chrome (menú ⋮ → Ayuda → Información de Google Chrome) o usa los Subtítulos automáticos de Chrome.");
-      throw e;
+  // Chrome corta la escucha cada cierto tiempo: la reiniciamos sola, con una instancia nueva
+  rec.onend=()=>{ scheduleRestart(failCount>3?2000:250); };
+  try{
+    if(audioTrack && audioTrack.readyState==="live"){
+      recTrack=audioTrack.clone();          // copia del audio para cada sesión
+      rec.start(recTrack);
+    } else {
+      if($("fuente").value==="sistema"){ showWarn("Se dejó de compartir el audio. Pulsa Detener y vuelve a Iniciar."); stop(); return; }
+      rec.start();
     }
-  } else rec.start();
+    lastActivity=Date.now();
+  }catch(e){
+    failCount++;
+    if(failCount>5) showWarn("El reconocimiento no logra reiniciarse ("+e.name+": "+e.message+"). Sigue reintentando… Si no vuelve, pulsa Detener e Iniciar, o actualiza Chrome.",true);
+    scheduleRestart(1000);
+  }
 }
+function scheduleRestart(ms){
+  if(!running) return;
+  clearTimeout(restartTimer);
+  restartTimer=setTimeout(()=>{ try{ startRec(); }catch(e){ scheduleRestart(1500); } }, ms);
+}
+// Vigilante: si pasan 15 s sin ninguna señal del reconocimiento, lo reinicia
+setInterval(()=>{
+  if(running && lastActivity && Date.now()-lastActivity>15000){
+    lastActivity=Date.now(); failCount++; scheduleRestart(0);
+  }
+},3000);
 
 /* ---------- Medidor de audio (para saber si llega sonido) ---------- */
 let audioCtx=null, meterRAF=null, gotResult=false, loudSince=0;
@@ -295,14 +320,16 @@ async function start(){
   Promise.race([setupTranslator(), new Promise(r=>setTimeout(r,20000))])
     .then(()=>{ $("engine").textContent="Motor de traducción: "+(translator?engine:"Servicio en línea (MyMemory / Google)"); })
     .catch(()=>{ translator=null; $("engine").textContent="Motor de traducción: Servicio en línea (MyMemory / Google)"; });
-  running=true; gotResult=false; loudSince=0;
+  running=true; gotResult=false; loudSince=0; failCount=0;
   try{ startRec(); if(audioTrack) startMeter(audioTrack); }
   catch(e){ if(!$("warn").textContent||$("warn").style.display==="none") showWarn("No se pudo iniciar el reconocimiento de voz ("+e.name+"): "+e.message); running=false; if(shareStream){ shareStream.getTracks().forEach(t=>t.stop()); shareStream=null; } }
   $("btnStart").disabled=false;
   if(running){ $("btnStart").textContent="■ Detener"; $("btnStart").classList.add("on"); setStatus(true,"Escuchando…"); }
 }
 function stop(){
-  running=false; try{ rec&&rec.stop(); }catch(e){}
+  running=false; clearTimeout(restartTimer);
+  if(rec){ rec.onend=null; try{ rec.abort(); }catch(e){} }
+  if(recTrack){ try{ recTrack.stop(); }catch(e){} recTrack=null; }
   if(shareStream){ shareStream.getTracks().forEach(t=>t.stop()); shareStream=null; }
   audioTrack=null; stopMeter();
   clearInterim();
