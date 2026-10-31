@@ -2,7 +2,7 @@
 chcp 65001 >nul
 title Traductor en vivo
 cd /d "%~dp0"
-echo Preparando el traductor (la primera vez tarda unos minutos)...
+echo Revisando instalacion (unos segundos)...
 python -m pip install --disable-pip-version-check -q -r requirements.txt
 if errorlevel 1 (
   echo.
@@ -10,4 +10,6 @@ if errorlevel 1 (
   pause
   exit /b
 )
+echo Instalacion lista. Iniciando...
 python traductor.py
+pause

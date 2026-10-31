@@ -47,6 +47,14 @@ FRASES_FANTASMA = {  # cosas que Whisper "inventa" en silencio
 SR = 16000  # Whisper trabaja a 16 kHz
 
 
+def log(msg):
+    """Muestra en la ventana negra qué está pasando."""
+    try:
+        print(datetime.datetime.now().strftime("[%H:%M:%S] ") + str(msg), flush=True)
+    except Exception:
+        pass
+
+
 # ---------------------------------------------------------------------------
 # 1) CAPTURA DEL SONIDO DE LA PC (WASAPI loopback) con reconexión automática
 # ---------------------------------------------------------------------------
@@ -184,6 +192,9 @@ class Segmentador(threading.Thread):
                     previo.append(x)
             else:
                 self.app.nivel = 0.0
+            if ahora - getattr(self, "_ultimo_aviso", 0) > 10:
+                self._ultimo_aviso = ahora
+                log(f"   nivel de sonido: {self.app.nivel:.4f}  (límite para voz: {self.umbral():.4f})")
             sin_audio = x is None and (ahora - ultima_voz) > PAUSA_FIN_FRASE
             if hablando and (silencio >= PAUSA_FIN_FRASE or sin_audio or dur >= FRAGMENTO_MAX):
                 silencio = 0.0
@@ -194,6 +205,7 @@ class Segmentador(threading.Thread):
                     audio = np.clip(audio * (0.9 / pico), -1, 1).astype(np.float32)  # normaliza volumen
                     self.cola_frases.put((datetime.datetime.now().strftime("%H:%M:%S"), audio))
                     self.app.frases_detectadas += 1
+                    log(f"🎤 Frase detectada ({len(audio)/SR:.1f} s) — transcribiendo…")
 
 
 # ---------------------------------------------------------------------------
@@ -232,7 +244,9 @@ class Transcriptor(threading.Thread):
                 self.app.estado_modelo(f"🔁 Error al transcribir, sigo… ({e})")
                 continue
             if not texto or texto.lower() in FRASES_FANTASMA:
+                log("   (no se entendió voz en esa frase)")
                 continue
+            log("   📝 " + texto)
             n += 1
             self.app.cola_ui.put(("orig", n, hora, texto))
             self.cola_trad.put((n, hora, texto))
@@ -259,6 +273,7 @@ class Traductor(threading.Thread):
                     trad = GoogleTranslator(source=src, target=dst).translate(texto)
                 except Exception:
                     time.sleep(0.8 * (intento + 1))
+            log("   🌎 " + (trad or "[sin traducción — revisa tu internet]"))
             self.app.cola_ui.put(("trad", n, hora, trad or "[sin traducción — revisa tu internet]"))
 
 
@@ -417,9 +432,11 @@ class App:
             pass
 
     def estado_audio(self, msg):
+        log(msg)
         self.cola_ui.put(("estado_audio", 0, "", msg))
 
     def estado_modelo(self, msg):
+        log(msg)
         self.cola_ui.put(("estado_modelo", 0, "", msg))
 
     def _escribir(self, txt, n, hora, texto, marcador=False):
@@ -472,8 +489,10 @@ class App:
 
 if __name__ == "__main__":
     try:
+        log("Abriendo la ventana del traductor…")
         root = tk.Tk()
         App(root)
+        log("✅ Ventana abierta. Si no la ves, búscala en la barra de tareas (icono de pluma).")
         root.mainloop()
     except Exception:
         traceback.print_exc()
