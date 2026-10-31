@@ -12,6 +12,10 @@ Solo Windows. Ejecuta INICIAR.bat (instala todo la primera vez).
 """
 
 import os
+os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
+os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+import warnings
+warnings.filterwarnings("ignore")
 import queue
 import threading
 import time
@@ -130,6 +134,14 @@ def a_16k_mono(raw, canales, tasa):
 
 
 class Segmentador(threading.Thread):
+    def run(self):
+        while True:
+            try:
+                self._run()
+            except Exception as e:
+                self.app.cola_ui.put(("estado_modelo", 0, "", f"🔁 Reiniciando detector de voz… ({e})"))
+                time.sleep(1)
+
     def __init__(self, cola_audio, cola_frases, app):
         super().__init__(daemon=True)
         self.cola_audio = cola_audio
@@ -137,10 +149,10 @@ class Segmentador(threading.Thread):
         self.app = app
 
     def umbral(self):
-        s = self.app.sensibilidad.get()          # 1..10
+        s = self.app.sens_val                    # 1..10 (copiado desde la ventana)
         return 0.03 * (0.68 ** (s - 1))         # más sensibilidad = umbral más bajo
 
-    def run(self):
+    def _run(self):
         buf, dur = [], 0.0
         previo = collections.deque(maxlen=8)    # ~0.4 s antes de que empiece la voz
         hablando = False
@@ -181,6 +193,7 @@ class Segmentador(threading.Thread):
                     pico = float(np.max(np.abs(audio))) or 1.0
                     audio = np.clip(audio * (0.9 / pico), -1, 1).astype(np.float32)  # normaliza volumen
                     self.cola_frases.put((datetime.datetime.now().strftime("%H:%M:%S"), audio))
+                    self.app.frases_detectadas += 1
 
 
 # ---------------------------------------------------------------------------
@@ -260,6 +273,8 @@ class App:
         self.cola_ui = queue.Queue()
         self.nivel = 0.0
         self.fuente = 20
+        self.sens_val, self.src_code, self.dst_code = 6.0, "en", "es"
+        self.frases_detectadas = 0
         self.archivo = self._archivo_nuevo()
 
         root.title("Traductor en vivo — Teams")
@@ -319,9 +334,12 @@ class App:
         self.lbl_audio.pack(side="left")
         self.lbl_modelo = tk.Label(pie, text="", bg=self.PANEL, fg=self.MUTED, font=("Segoe UI", 9))
         self.lbl_modelo.pack(side="left", padx=20)
+        self.lbl_frases = tk.Label(pie, text="", bg=self.PANEL, fg=self.MUTED, font=("Segoe UI", 9))
+        self.lbl_frases.pack(side="left", padx=10)
         tk.Label(pie, text=f"Se guarda en: {os.path.relpath(self.archivo)}", bg=self.PANEL, fg=self.MUTED,
                  font=("Segoe UI", 9)).pack(side="right")
 
+        self._copiar_controles()
         # hilos de trabajo
         cola_audio, cola_frases, cola_trad = queue.Queue(maxsize=2000), queue.Queue(), queue.Queue()
         CapturaPC(cola_audio, self.estado_audio).start()
@@ -351,10 +369,19 @@ class App:
         self.cb_src.set(b); self.cb_dst.set(a); self._titulos()
 
     def idioma_origen(self):
-        return IDIOMAS.get(self.cb_src.get(), "en")
+        return self.src_code
 
     def idioma_destino(self):
-        return IDIOMAS.get(self.cb_dst.get(), "es")
+        return self.dst_code
+
+    def _copiar_controles(self):
+        # SOLO en el hilo principal: copiar los valores de la ventana a variables normales
+        try:
+            self.sens_val = float(self.sensibilidad.get())
+            self.src_code = IDIOMAS.get(self.cb_src.get(), "en")
+            self.dst_code = IDIOMAS.get(self.cb_dst.get(), "es")
+        except Exception:
+            pass
 
     def _letra(self, d):
         self.fuente = max(12, min(60, self.fuente + d))
@@ -404,6 +431,7 @@ class App:
         txt.see("end")
 
     def _tick(self):
+        self._copiar_controles()
         try:
             while True:
                 tipo, n, hora, texto = self.cola_ui.get_nowait()
@@ -429,9 +457,10 @@ class App:
         # medidor de nivel y línea del umbral
         w = 120
         self.medidor.coords(self.barra_nivel, 0, 0, min(w, self.nivel * 2000), 10)
-        umbral = 0.03 * (0.68 ** (self.sensibilidad.get() - 1))
+        umbral = 0.03 * (0.68 ** (self.sens_val - 1))
         x = min(w - 1, umbral * 2000)
         self.medidor.coords(self.linea_umbral, x, 0, x, 10)
+        self.lbl_frases.config(text=f"Frases detectadas: {self.frases_detectadas}")
         self.root.after(60, self._tick)
 
     def _cerrar(self):
