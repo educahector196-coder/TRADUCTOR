@@ -65,6 +65,11 @@
   <button id="btnClear">Limpiar</button>
 </header>
 <div class="warn" id="warn"></div>
+<div id="meterBox" style="display:none;align-items:center;gap:10px;padding:6px 16px;font-size:12px;color:var(--muted);border-bottom:1px solid var(--line)">
+  Audio que llega:
+  <div style="flex:0 0 220px;height:8px;background:#222632;border-radius:4px;overflow:hidden"><div id="meterBar" style="height:100%;width:0;background:var(--ok);transition:width .08s"></div></div>
+  <span>(si la barra no se mueve cuando hablan, no se está compartiendo el audio)</span>
+</div>
 <main id="main">
   <section id="colOrig"><h2 id="hOrig">Original</h2><div class="feed" id="orig"></div></section>
   <section id="colTrad"><h2 id="hTrad">Traducción</h2><div class="feed" id="trad"></div></section>
@@ -99,7 +104,7 @@ function locale(code){ return LANGS.find(l=>l[0]===code)[1]; }
 
 /* ---------- Traducción ---------- */
 async function setupTranslator(){
-  translator=null; engine="";
+  translator=null; engine="Servicio en línea (MyMemory / Google)";
   const s=src.value, d=dst.value;
   if(s===d){ engine="ninguno (mismo idioma)"; return; }
   // 1) Traductor integrado de Chrome (en el dispositivo, rápido y gratis)
@@ -187,15 +192,20 @@ function startRec(){
     }
     if(interim) setInterim(interim);
   };
+  const origOnResult=rec.onresult;
+  rec.onresult=e=>{ gotResult=true; origOnResult(e); };
   rec.onerror=e=>{
+    if(e.error==="no-speech"||e.error==="aborted") return;
     if(e.error==="not-allowed"||e.error==="service-not-allowed"){
-      showWarn("El navegador no dio permiso al micrófono. Haz clic en el candado de la barra de direcciones → Micrófono → Permitir, y vuelve a iniciar.");
+      showWarn("El navegador bloqueó el reconocimiento de voz (error: "+e.error+"). Si estás en Brave, usa Chrome o Edge. En Chrome: candado de la barra de direcciones → Micrófono → Permitir, y vuelve a iniciar.");
       stop();
     }else if(e.error==="audio-capture"){
-      showWarn("No se encontró micrófono. Revisa que esté conectado y seleccionado en Windows.");
+      showWarn("No llega audio al reconocimiento (error: audio-capture). Revisa que el micrófono o el audio compartido estén activos.");
       stop();
     }else if(e.error==="network"){
-      showWarn("El reconocimiento de voz de Chrome/Edge necesita internet. Revisa tu conexión.");
+      showWarn("El reconocimiento de voz necesita internet (error: network). Revisa tu conexión.");
+    }else{
+      showWarn("Error del reconocimiento de voz: "+e.error+(e.message?" — "+e.message:""));
     }
   };
   // Chrome corta la escucha cada cierto tiempo: la reiniciamos sola
@@ -203,17 +213,59 @@ function startRec(){
   go();
 }
 function go(){
-  if(audioTrack && audioTrack.readyState==="live") rec.start(audioTrack); else rec.start();
+  if(audioTrack && audioTrack.readyState==="live"){
+    try{ rec.start(audioTrack); }
+    catch(e){
+      showWarn("Tu navegador no permite transcribir el audio compartido ("+e.name+": "+e.message+"). Actualiza Chrome (menú ⋮ → Ayuda → Información de Google Chrome) o usa los Subtítulos automáticos de Chrome.");
+      throw e;
+    }
+  } else rec.start();
+}
+
+/* ---------- Medidor de audio (para saber si llega sonido) ---------- */
+let audioCtx=null, meterRAF=null, gotResult=false, loudSince=0;
+function startMeter(track){
+  try{
+    audioCtx=new (window.AudioContext||window.webkitAudioContext)();
+    const srcNode=audioCtx.createMediaStreamSource(new MediaStream([track]));
+    const an=audioCtx.createAnalyser(); an.fftSize=512; srcNode.connect(an);
+    const buf=new Uint8Array(an.fftSize);
+    $("meterBox").style.display="flex";
+    const tick=()=>{
+      an.getByteTimeDomainData(buf);
+      let s=0; for(const v of buf){ const x=(v-128)/128; s+=x*x; }
+      const lvl=Math.min(1,Math.sqrt(s/buf.length)*4);
+      $("meterBar").style.width=(lvl*100)+"%";
+      if(lvl>0.05){ if(!loudSince) loudSince=Date.now(); }
+      if(loudSince && !gotResult && Date.now()-loudSince>12000){
+        showWarn("El audio SÍ está llegando (la barra verde se mueve), pero el navegador no lo está transcribiendo. Tu versión de Chrome/Edge todavía no permite transcribir audio compartido. Solución: actualiza el navegador, o usa los Subtítulos automáticos con traducción de Chrome (Configuración → Accesibilidad).");
+        loudSince=Infinity;
+      }
+      meterRAF=requestAnimationFrame(tick);
+    };
+    tick();
+  }catch(e){ console.warn(e); }
+}
+function stopMeter(){
+  cancelAnimationFrame(meterRAF); meterRAF=null;
+  try{ audioCtx&&audioCtx.close(); }catch(e){} audioCtx=null;
+  $("meterBox").style.display="none"; loudSince=0;
 }
 
 /* Capturar el audio de Teams o de un video compartiendo pantalla/pestaña */
 async function captureSystemAudio(){
   if(!navigator.mediaDevices?.getDisplayMedia) throw new Error("Tu navegador no permite capturar audio de pantalla.");
-  shareStream = await navigator.mediaDevices.getDisplayMedia({
-    video:true,
-    audio:{echoCancellation:false,noiseSuppression:false,autoGainControl:false},
-    systemAudio:"include", selfBrowserSurface:"exclude"
-  });
+  try{
+    shareStream = await navigator.mediaDevices.getDisplayMedia({
+      video:true,
+      audio:{echoCancellation:false,noiseSuppression:false,autoGainControl:false},
+      systemAudio:"include", selfBrowserSurface:"exclude"
+    });
+  }catch(e){
+    if(e.name==="NotAllowedError") throw e;
+    // algunos navegadores no aceptan las opciones extra: probamos lo básico
+    shareStream = await navigator.mediaDevices.getDisplayMedia({video:true,audio:true});
+  }
   const tracks=shareStream.getAudioTracks();
   if(!tracks.length){
     shareStream.getTracks().forEach(t=>t.stop()); shareStream=null;
@@ -232,21 +284,27 @@ async function start(){
   if($("fuente").value==="sistema"){
     try{ await captureSystemAudio(); }
     catch(e){
-      showWarn(e.name==="NotAllowedError" ? "Cancelaste la ventana para compartir. Pulsa Iniciar otra vez y elige qué compartir." : e.message);
+      showWarn(e.name==="NotAllowedError"
+        ? "No se compartió nada (se canceló o el navegador lo bloqueó). Pulsa Iniciar otra vez, elige la pestaña o la pantalla, marca «Compartir audio» y pulsa Compartir. Si estás en Brave, usa Chrome o Edge."
+        : "No se pudo compartir ("+e.name+"): "+e.message);
       $("btnStart").disabled=false; setStatus(false,"Detenido"); return;
     }
   }
-  await setupTranslator();
-  $("engine").textContent="Motor de traducción: "+engine;
-  running=true;
-  try{ startRec(); }catch(e){ showWarn("No se pudo iniciar el micrófono: "+e.message); running=false; }
+  // El traductor se prepara en segundo plano (máx. 20 s); mientras tanto se usa el servicio en línea
+  $("engine").textContent="Motor de traducción: servicio en línea (preparando traductor del navegador…)";
+  Promise.race([setupTranslator(), new Promise(r=>setTimeout(r,20000))])
+    .then(()=>{ $("engine").textContent="Motor de traducción: "+(translator?engine:"Servicio en línea (MyMemory / Google)"); })
+    .catch(()=>{ translator=null; $("engine").textContent="Motor de traducción: Servicio en línea (MyMemory / Google)"; });
+  running=true; gotResult=false; loudSince=0;
+  try{ startRec(); if(audioTrack) startMeter(audioTrack); }
+  catch(e){ if(!$("warn").textContent||$("warn").style.display==="none") showWarn("No se pudo iniciar el reconocimiento de voz ("+e.name+"): "+e.message); running=false; if(shareStream){ shareStream.getTracks().forEach(t=>t.stop()); shareStream=null; } }
   $("btnStart").disabled=false;
   if(running){ $("btnStart").textContent="■ Detener"; $("btnStart").classList.add("on"); setStatus(true,"Escuchando…"); }
 }
 function stop(){
   running=false; try{ rec&&rec.stop(); }catch(e){}
   if(shareStream){ shareStream.getTracks().forEach(t=>t.stop()); shareStream=null; }
-  audioTrack=null;
+  audioTrack=null; stopMeter();
   clearInterim();
   $("btnStart").textContent="▶ Iniciar"; $("btnStart").classList.remove("on"); setStatus(false,"Detenido");
 }
