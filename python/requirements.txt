@@ -1,0 +1,4 @@
+numpy
+PyAudioWPatch
+faster-whisper
+deep-translator
