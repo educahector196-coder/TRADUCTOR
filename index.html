@@ -63,6 +63,7 @@
   <button id="btnCopy">Copiar</button>
   <button id="btnSave">Descargar .txt</button>
   <button id="btnClear">Limpiar</button>
+  <button id="btnReshare" style="display:none;background:#2d6a4f;border-color:#3ecf8e">🔁 Volver a compartir audio</button>
 </header>
 <div class="warn" id="warn"></div>
 <div id="meterBox" style="display:none;align-items:center;gap:10px;padding:6px 16px;font-size:12px;color:var(--muted);border-bottom:1px solid var(--line)">
@@ -74,7 +75,7 @@
   <section id="colOrig"><h2 id="hOrig">Original</h2><div class="feed" id="orig"></div></section>
   <section id="colTrad"><h2 id="hTrad">Traducción</h2><div class="feed" id="trad"></div></section>
 </main>
-<div class="note" id="engine">Motor de traducción: —</div>
+<div class="note"><span id="engine">Motor de traducción: —</span> <span id="note" style="display:none;margin-left:12px;color:#ffd38a"></span></div>
 
 <script>
 const LANGS = [
@@ -97,6 +98,7 @@ let rec=null, running=false, translator=null, engine="", transcript=[];
 let interimOrigEl=null, interimTradEl=null, interimTimer=null, lastInterim="";
 
 function showWarn(m,temp){ const w=$("warn"); w.textContent=m; w.dataset.temp=temp?"1":""; w.style.display="block"; }
+function note(m){ const n=$("note"); if(!n) return; n.textContent=m||""; n.style.display=m?"inline":"none"; }
 function hideWarn(){ $("warn").style.display="none"; }
 function setStatus(on,txt){ $("dot").classList.toggle("on",on); $("statusTxt").textContent=txt; }
 function now(){ return new Date().toLocaleTimeString("es-PE",{hour:"2-digit",minute:"2-digit",second:"2-digit"}); }
@@ -200,7 +202,7 @@ function startRec(){
   rec.onstart=rec.onaudiostart=()=>{ lastActivity=Date.now(); };
   rec.onresult=e=>{
     gotResult=true; lastActivity=Date.now(); failCount=0;
-    if($("warn").dataset.temp==="1") hideWarn();
+    if(!shareLost) note("");
     let interim="";
     for(let i=e.resultIndex;i<e.results.length;i++){
       const r=e.results[i];
@@ -211,28 +213,27 @@ function startRec(){
   rec.onerror=e=>{
     if(e.error==="no-speech"||e.error==="aborted") return;
     if(e.error==="not-allowed"||e.error==="service-not-allowed"){
-      showWarn("El navegador bloqueó el reconocimiento de voz (error: "+e.error+"). Si estás en Brave, usa Chrome o Edge. En Chrome: candado de la barra de direcciones → Micrófono → Permitir, y vuelve a iniciar.");
-      stop(); return;
+      failCount++; note("Reintentando el reconocimiento de voz… (si sigue así, usa Chrome o Edge)"); return;
     }
     failCount++;
-    if(e.error==="network") showWarn("Se cortó la conexión del reconocimiento de voz. Reintentando…",true);
-    else showWarn("Error del reconocimiento ("+e.error+"). Reintentando…",true);
+    note(e.error==="network" ? "Conexión inestable, reintentando…" : "Reconectando…");
   };
   // Chrome corta la escucha cada cierto tiempo: la reiniciamos sola, con una instancia nueva
-  rec.onend=()=>{ scheduleRestart(failCount>3?2000:250); };
+  rec.onend=()=>{ scheduleRestart(failCount>3?1500:200); };
   try{
     if(audioTrack && audioTrack.readyState==="live"){
       recTrack=bridgeTrack();               // pista nueva para cada sesión; la compartida no se toca
       rec.start(recTrack);
     } else {
-      if($("fuente").value==="sistema"){ showWarn("El audio compartido se cortó. Pulsa Detener y luego Iniciar para volver a compartir."); scheduleRestart(3000); return; }
-      rec.start();
+      rec.start();   // micrófono (o respaldo si se perdió el audio compartido)
     }
     lastActivity=Date.now();
   }catch(e){
     failCount++;
-    if(failCount>5) showWarn("El reconocimiento no logra reiniciarse ("+e.name+": "+e.message+"). Sigue reintentando… Si no vuelve, pulsa Detener e Iniciar, o actualiza Chrome.",true);
-    scheduleRestart(1000);
+    // si la pista compartida da problemas varias veces, seguimos por el micrófono
+    if(failCount>5 && audioTrack){ onShareLost(); }
+    note("Reconectando…");
+    scheduleRestart(Math.min(5000,500*failCount));
   }
 }
 function scheduleRestart(ms){
@@ -250,7 +251,12 @@ setInterval(()=>{
 /* ---------- Medidor de audio (para saber si llega sonido) ---------- */
 let shareNode=null, bridgeDest=null;
 function bridgeTrack(){
-  if(!audioCtx||!shareNode) return audioTrack.clone();
+  if(!audioCtx||!shareNode){
+    try{
+      audioCtx=audioCtx||new (window.AudioContext||window.webkitAudioContext)();
+      shareNode=audioCtx.createMediaStreamSource(new MediaStream([audioTrack]));
+    }catch(e){ return audioTrack.clone(); }
+  }
   if(audioCtx.state==="suspended") audioCtx.resume();
   bridgeDest=audioCtx.createMediaStreamDestination();
   shareNode.connect(bridgeDest);
@@ -277,7 +283,7 @@ function startMeter(track){
       $("meterBar").style.width=(lvl*100)+"%";
       if(lvl>0.05){ if(!loudSince) loudSince=Date.now(); }
       if(loudSince && !gotResult && Date.now()-loudSince>12000){
-        showWarn("El audio SÍ está llegando (la barra verde se mueve), pero el navegador no lo está transcribiendo. Tu versión de Chrome/Edge todavía no permite transcribir audio compartido. Solución: actualiza el navegador, o usa los Subtítulos automáticos con traducción de Chrome (Configuración → Accesibilidad).");
+        note("Llega audio pero no se transcribe: actualiza Chrome (⋮ → Ayuda → Información de Google Chrome).");
         loudSince=Infinity;
       }
       meterRAF=requestAnimationFrame(tick);
@@ -311,8 +317,27 @@ async function captureSystemAudio(){
     throw new Error("No se compartió audio. Vuelve a iniciar y, en la ventana para compartir, marca la casilla «Compartir audio del sistema» (pantalla completa) o «Compartir audio de la pestaña».");
   }
   audioTrack=tracks[0];
-  audioTrack.onended=()=>{ if(running) showWarn("El audio compartido se cortó. Pulsa Detener y luego Iniciar para volver a compartir."); };
-  shareStream.getVideoTracks().forEach(v=>v.onended=()=>{ if(running){ showWarn("Dejaste de compartir la pantalla/pestaña. Pulsa Iniciar para volver a compartir."); stop(); } });
+  shareLost=false;
+  audioTrack.onended=()=>{ if(running) onShareLost(); };
+  shareStream.getVideoTracks().forEach(v=>v.onended=()=>{ if(running) onShareLost(); });
+}
+let shareLost=false;
+function onShareLost(){
+  if(shareLost) return; shareLost=true;
+  releaseRecTrack();
+  if(shareStream){ shareStream.getTracks().forEach(t=>{ t.onended=null; try{ t.stop(); }catch(e){} }); shareStream=null; }
+  audioTrack=null; stopMeter();
+  $("btnReshare").style.display="inline-block";
+  note("El audio compartido se cortó: sigo escuchando por el micrófono. Pulsa «Volver a compartir audio» cuando puedas.");
+  scheduleRestart(0);
+}
+async function reshare(){
+  try{
+    await captureSystemAudio();
+    startMeter(audioTrack);
+    $("btnReshare").style.display="none"; note(""); failCount=0;
+    scheduleRestart(0);
+  }catch(e){ note("No se volvió a compartir. Puedes intentarlo otra vez con el botón verde."); }
 }
 
 async function start(){
@@ -323,10 +348,12 @@ async function start(){
   if($("fuente").value==="sistema"){
     try{ await captureSystemAudio(); }
     catch(e){
-      showWarn(e.name==="NotAllowedError"
-        ? "No se compartió nada (se canceló o el navegador lo bloqueó). Pulsa Iniciar otra vez, elige la pestaña o la pantalla, marca «Compartir audio» y pulsa Compartir. Si estás en Brave, usa Chrome o Edge."
-        : "No se pudo compartir ("+e.name+"): "+e.message);
-      $("btnStart").disabled=false; setStatus(false,"Detenido"); return;
+      // sin audio compartido: arrancamos igual con el micrófono y ofrecemos volver a compartir
+      shareLost=true; audioTrack=null;
+      $("btnReshare").style.display="inline-block";
+      setTimeout(()=>note(e.name==="NotAllowedError"
+        ? "No se compartió audio: escuchando por el micrófono. Pulsa «Volver a compartir audio» y marca «Compartir audio»."
+        : "No se pudo compartir el audio ("+e.message+"): escuchando por el micrófono."),50);
     }
   }
   // El traductor se prepara en segundo plano (máx. 20 s); mientras tanto se usa el servicio en línea
@@ -335,8 +362,9 @@ async function start(){
     .then(()=>{ $("engine").textContent="Motor de traducción: "+(translator?engine:"Servicio en línea (MyMemory / Google)"); })
     .catch(()=>{ translator=null; $("engine").textContent="Motor de traducción: Servicio en línea (MyMemory / Google)"; });
   running=true; gotResult=false; loudSince=0; failCount=0;
-  try{ if(audioTrack) startMeter(audioTrack); startRec(); }
-  catch(e){ if(!$("warn").textContent||$("warn").style.display==="none") showWarn("No se pudo iniciar el reconocimiento de voz ("+e.name+"): "+e.message); stop(); }
+  try{ if(audioTrack) startMeter(audioTrack); }catch(e){}
+  scheduleRestart(0);
+  keepAwake();
   $("btnStart").disabled=false;
   if(running){ $("btnStart").textContent="■ Detener"; $("btnStart").classList.add("on"); setStatus(true,"Escuchando…"); }
 }
@@ -345,11 +373,20 @@ function stop(){
   if(rec){ rec.onend=null; try{ rec.abort(); }catch(e){} }
   releaseRecTrack();
   if(shareStream){ shareStream.getTracks().forEach(t=>t.stop()); shareStream=null; }
-  audioTrack=null; stopMeter();
+  audioTrack=null; stopMeter(); shareLost=false;
+  $("btnReshare").style.display="none"; note("");
+  try{ wakeLock&&wakeLock.release(); }catch(e){} wakeLock=null;
   clearInterim();
   $("btnStart").textContent="▶ Iniciar"; $("btnStart").classList.remove("on"); setStatus(false,"Detenido");
 }
 $("btnStart").onclick=()=> running?stop():start();
+$("btnReshare").onclick=reshare;
+// Evitar que la laptop apague la pantalla o se suspenda en plena reunión
+let wakeLock=null;
+async function keepAwake(){ try{ if("wakeLock" in navigator && running) wakeLock=await navigator.wakeLock.request("screen"); }catch(e){} }
+document.addEventListener("visibilitychange",()=>{ if(document.visibilityState==="visible" && running){ keepAwake(); if(audioCtx&&audioCtx.state==="suspended") audioCtx.resume(); } });
+// Evitar cerrar la pestaña por accidente durante la reunión
+window.addEventListener("beforeunload",e=>{ if(running){ e.preventDefault(); e.returnValue=""; } });
 function nameOf(c){ return LANGS.find(l=>l[0]===c)[2]; }
 function updateHeaders(){
   $("hOrig").textContent=`${nameOf(src.value)} — lo que se dice`;
@@ -357,7 +394,8 @@ function updateHeaders(){
 }
 updateHeaders();
 [src,dst].forEach(s=>s.onchange=()=>{ updateHeaders(); if(running){ translator=null; setupTranslator(); scheduleRestart(0); } });
-$("fuente").onchange=()=>{ if(running){ stop(); start(); } };
+$("fuente").onchange=()=>{ if(!running) return;
+  if($("fuente").value==="sistema") reshare(); else onShareLost(); };
 $("btnSwap").onclick=()=>{ [src.value,dst.value]=[dst.value,src.value]; updateHeaders(); if(running){ translator=null; setupTranslator(); scheduleRestart(0); } };
 
 /* ---------- Botones extra ---------- */
