@@ -491,6 +491,109 @@ class IA:
 
 
 # ---------------------------------------------------------------------------
+# 4c) GUION: sigue en qué línea va la conversación
+# ---------------------------------------------------------------------------
+import re
+import difflib
+import unicodedata
+
+RUTA_GUION = os.path.join(os.path.dirname(os.path.abspath(__file__)), "guion.json")
+
+
+def _palabras(texto):
+    t = unicodedata.normalize("NFKD", texto.lower())
+    t = "".join(c for c in t if not unicodedata.combining(c))
+    t = t.replace("’", "'")
+    reemplazos = {"i'm": "i am", "you're": "you are", "it's": "it is", "what's": "what is",
+                  "that's": "that is", "don't": "do not", "let's": "let us"}
+    for a, b in reemplazos.items():
+        t = t.replace(a, b)
+    return re.findall(r"[a-z0-9]+", t)
+
+
+def cargar_guion():
+    """Devuelve el guion si existe y no venció. Si venció, lo borra."""
+    try:
+        with open(RUTA_GUION, encoding="utf-8") as f:
+            g = json.load(f)
+    except Exception:
+        return None
+    try:
+        hasta = datetime.date.fromisoformat(g.get("hasta", "2999-12-31"))
+    except Exception:
+        hasta = datetime.date(2999, 12, 31)
+    if datetime.date.today() > hasta:
+        try:
+            os.remove(RUTA_GUION)
+            log("🗑️ El guion venció y fue borrado.")
+        except Exception:
+            pass
+        return None
+    for ln in g["lineas"]:
+        ln["pal"] = _palabras(ln["en"])
+    return g
+
+
+class Seguidor:
+    """Compara lo que se escucha con las próximas líneas del guion."""
+    VENTANA = 6
+
+    def __init__(self, guion):
+        self.g = guion
+        self.lineas = guion["lineas"]
+        self.yo = guion.get("yo", "")
+        self.pos = 0            # primera línea que todavía no se dijo
+        self.en_curso = None    # línea que se está diciendo ahora
+        self.buffer = []
+
+    def _puntaje(self, linea):
+        objetivo = linea["pal"]
+        if not objetivo:
+            return 0.0
+        cola = self.buffer[-(len(objetivo) + 8):]
+        m = difflib.SequenceMatcher(None, objetivo, cola, autojunk=False)
+        iguales = sum(b.size for b in m.get_matching_blocks())
+        return iguales / len(objetivo)
+
+    def oir(self, texto):
+        """Devuelve True si cambió la posición."""
+        self.buffer += _palabras(texto)
+        self.buffer = self.buffer[-60:]
+        mejor, mejor_i = 0.0, None
+        for i in range(self.pos, min(len(self.lineas), self.pos + self.VENTANA)):
+            ln = self.lineas[i]
+            if ln["quien"] == self.yo and i != self.pos:
+                continue  # mis líneas no se oyen por Teams (solo la actual, por si hay eco)
+            sc = self._puntaje(ln)
+            # las líneas muy cortas ("Goodbye!") necesitan coincidencia exacta
+            umbral = 0.99 if len(ln["pal"]) <= 2 else 0.6
+            if sc >= umbral and sc > mejor + 0.05:
+                mejor, mejor_i = sc, i
+            elif i == self.pos + 1 and sc >= 0.35 and self.en_curso is None and len(ln["pal"]) > 4:
+                self.en_curso = i
+        if mejor_i is not None:
+            self.pos = mejor_i + 1
+            self.en_curso = None
+            self.buffer = []
+            return True
+        # línea larga a medio decir
+        for i in range(self.pos, min(len(self.lineas), self.pos + 3)):
+            ln = self.lineas[i]
+            if ln["quien"] != self.yo and len(ln["pal"]) > 4 and self._puntaje(ln) >= 0.3:
+                if self.en_curso != i:
+                    self.en_curso = i
+                    return True
+        return False
+
+    def mi_turno(self):
+        """Índice de mi próxima línea."""
+        for i in range(self.pos, len(self.lineas)):
+            if self.lineas[i]["quien"] == self.yo:
+                return i
+        return None
+
+
+# ---------------------------------------------------------------------------
 # 5) VENTANA
 # ---------------------------------------------------------------------------
 class App:
@@ -551,8 +654,26 @@ class App:
         self.panel = tk.PanedWindow(root, orient="horizontal", bg="#2a2f3a", sashwidth=2, bd=0)
         self.col_orig, self.txt_orig, self.tit_orig = self._columna()
         self.col_trad, self.txt_trad, self.tit_trad = self._columna()
-        self.panel.add(self.col_orig, stretch="always")
-        self.panel.add(self.col_trad, stretch="always")
+        self.guion = cargar_guion()
+        self.seguidor = Seguidor(self.guion) if self.guion else None
+        if self.guion:
+            self.col_guion, self.txt_guion, self.tit_guion = self._columna()
+            self.col_guion.configure(bg="#14161c")
+            self.txt_guion.configure(bg="#14161c", font=("Segoe UI", 15), cursor="hand2", spacing1=4, spacing3=10)
+            self.tit_guion.configure(bg="#14161c", fg="#ffd38a",
+                                     text=f"📜 GUION — {self.guion.get('titulo', '')}   (↑↓ o clic para mover · vence {self.guion.get('hasta')})")
+            tg = self.txt_guion
+            tg.tag_configure("quien_yo", foreground="#3ecf8e", font=("Segoe UI", 10, "bold"))
+            tg.tag_configure("quien_otro", foreground="#8bb4ff", font=("Segoe UI", 10, "bold"))
+            tg.tag_configure("dicho", overstrike=True, foreground="#c0504d")
+            tg.tag_configure("en_curso", background="#4a4214", foreground="#fff3c4")
+            tg.tag_configure("turno", background="#1d4d33", foreground="#ffffff", font=("Segoe UI", 17, "bold"))
+            tg.tag_configure("marca", foreground="#3ecf8e", font=("Segoe UI", 11, "bold"))
+            tg.bind("<Button-1>", self._clic_guion)
+            root.bind("<Down>", lambda e: self._mover_guion(+1))
+            root.bind("<Up>", lambda e: self._mover_guion(-1))
+            self._pintar_guion()
+        self._armar_columnas(solo=False)
         self._titulos()
         self.solo = False
 
@@ -641,14 +762,62 @@ class App:
         for t in (self.txt_orig, self.txt_trad):
             t.configure(font=("Segoe UI", self.fuente))
 
+    def _armar_columnas(self, solo):
+        for c in (self.col_orig, getattr(self, "col_guion", None), self.col_trad):
+            if c is not None:
+                try:
+                    self.panel.forget(c)
+                except Exception:
+                    pass
+        if not solo:
+            self.panel.add(self.col_orig, stretch="always", width=380)
+        if getattr(self, "col_guion", None) is not None:
+            self.panel.add(self.col_guion, stretch="always", width=470)
+        self.panel.add(self.col_trad, stretch="always", width=380)
+
     def _solo(self):
         self.solo = not self.solo
-        if self.solo:
-            self.panel.forget(self.col_orig); self.btn_solo.config(text="Ver ambos")
-        else:
-            self.panel.forget(self.col_trad)
-            self.panel.add(self.col_orig, stretch="always"); self.panel.add(self.col_trad, stretch="always")
-            self.btn_solo.config(text="Solo traducción")
+        self._armar_columnas(self.solo)
+        self.btn_solo.config(text="Ver todo" if self.solo else "Solo traducción")
+
+    # ----- guion -----
+    def _pintar_guion(self):
+        sg, t = self.seguidor, self.txt_guion
+        turno = sg.mi_turno()
+        t.configure(state="normal"); t.delete("1.0", "end")
+        ver = None
+        for i, ln in enumerate(sg.lineas):
+            yo = ln["quien"] == sg.yo
+            t.insert("end", ("▶ TE TOCA  " if i == turno else ""), ("marca",))
+            t.insert("end", ln["quien"] + "\n", ("quien_yo" if yo else "quien_otro", f"g{i}"))
+            estilo = ("dicho",) if i < sg.pos else ("turno",) if i == turno else ("en_curso",) if i == sg.en_curso else ()
+            t.insert("end", ln["en"] + "\n", estilo + (f"g{i}",))
+            if i == max(0, (turno if turno is not None else sg.pos) - 2):
+                ver = t.index("end-2l")
+        if sg.pos >= len(sg.lineas):
+            t.insert("end", "\n✅ Guion terminado", ("marca",))
+        t.configure(state="disabled")
+        # dejar la línea actual arriba con un poco de contexto
+        if ver:
+            t.yview(ver)
+
+    def _mover_guion(self, d):
+        if not self.seguidor:
+            return
+        sg = self.seguidor
+        sg.pos = max(0, min(len(sg.lineas), sg.pos + d))
+        sg.en_curso, sg.buffer = None, []
+        self._pintar_guion()
+
+    def _clic_guion(self, e):
+        idx = self.txt_guion.index(f"@{e.x},{e.y}")
+        for tag in self.txt_guion.tag_names(idx):
+            if tag.startswith("g") and tag[1:].isdigit():
+                sg = self.seguidor
+                sg.pos, sg.en_curso, sg.buffer = int(tag[1:]), None, []
+                self._pintar_guion()
+                break
+        return "break"
 
     def _encima(self):
         self.root.attributes("-topmost", self.encima.get())
@@ -717,6 +886,8 @@ class App:
                 tipo, n, hora, texto = self.cola_ui.get_nowait()
                 if tipo == "orig":
                     self.historial.append((hora, texto))
+                    if self.seguidor and self.seguidor.oir(texto):
+                        self._pintar_guion()
                     self._escribir(self.txt_orig, n, hora, texto)
                     self._escribir(self.txt_trad, n, hora, "…")
                     self._pendiente = getattr(self, "_pendiente", {}); self._pendiente[n] = texto
