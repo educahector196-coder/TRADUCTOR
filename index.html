@@ -192,7 +192,7 @@ function startRec(){
   if(!running) return;
   // limpiar la instancia anterior
   if(rec){ rec.onend=rec.onerror=rec.onresult=rec.onstart=rec.onaudiostart=null; try{ rec.abort(); }catch(e){} }
-  if(recTrack){ try{ recTrack.stop(); }catch(e){} recTrack=null; }
+  releaseRecTrack();
   rec=new SR();
   rec.lang=locale(src.value);
   rec.continuous=true;
@@ -222,10 +222,10 @@ function startRec(){
   rec.onend=()=>{ scheduleRestart(failCount>3?2000:250); };
   try{
     if(audioTrack && audioTrack.readyState==="live"){
-      recTrack=audioTrack.clone();          // copia del audio para cada sesión
+      recTrack=bridgeTrack();               // pista nueva para cada sesión; la compartida no se toca
       rec.start(recTrack);
     } else {
-      if($("fuente").value==="sistema"){ showWarn("Se dejó de compartir el audio. Pulsa Detener y vuelve a Iniciar."); stop(); return; }
+      if($("fuente").value==="sistema"){ showWarn("El audio compartido se cortó. Pulsa Detener y luego Iniciar para volver a compartir."); scheduleRestart(3000); return; }
       rec.start();
     }
     lastActivity=Date.now();
@@ -242,17 +242,31 @@ function scheduleRestart(ms){
 }
 // Vigilante: si pasan 15 s sin ninguna señal del reconocimiento, lo reinicia
 setInterval(()=>{
-  if(running && lastActivity && Date.now()-lastActivity>15000){
-    lastActivity=Date.now(); failCount++; scheduleRestart(0);
+  if(running && lastActivity && Date.now()-lastActivity>20000){
+    lastActivity=Date.now(); scheduleRestart(0);
   }
 },3000);
 
 /* ---------- Medidor de audio (para saber si llega sonido) ---------- */
+let shareNode=null, bridgeDest=null;
+function bridgeTrack(){
+  if(!audioCtx||!shareNode) return audioTrack.clone();
+  if(audioCtx.state==="suspended") audioCtx.resume();
+  bridgeDest=audioCtx.createMediaStreamDestination();
+  shareNode.connect(bridgeDest);
+  return bridgeDest.stream.getAudioTracks()[0];
+}
+function releaseRecTrack(){
+  if(bridgeDest){ try{ shareNode&&shareNode.disconnect(bridgeDest); }catch(e){} bridgeDest=null; }
+  if(recTrack){ try{ recTrack.stop(); }catch(e){} recTrack=null; }
+}
 let audioCtx=null, meterRAF=null, gotResult=false, loudSince=0;
 function startMeter(track){
   try{
     audioCtx=new (window.AudioContext||window.webkitAudioContext)();
+    audioCtx.resume&&audioCtx.resume();
     const srcNode=audioCtx.createMediaStreamSource(new MediaStream([track]));
+    shareNode=srcNode;
     const an=audioCtx.createAnalyser(); an.fftSize=512; srcNode.connect(an);
     const buf=new Uint8Array(an.fftSize);
     $("meterBox").style.display="flex";
@@ -273,7 +287,7 @@ function startMeter(track){
 }
 function stopMeter(){
   cancelAnimationFrame(meterRAF); meterRAF=null;
-  try{ audioCtx&&audioCtx.close(); }catch(e){} audioCtx=null;
+  try{ audioCtx&&audioCtx.close(); }catch(e){} audioCtx=null; shareNode=null; bridgeDest=null;
   $("meterBox").style.display="none"; loudSince=0;
 }
 
@@ -297,8 +311,8 @@ async function captureSystemAudio(){
     throw new Error("No se compartió audio. Vuelve a iniciar y, en la ventana para compartir, marca la casilla «Compartir audio del sistema» (pantalla completa) o «Compartir audio de la pestaña».");
   }
   audioTrack=tracks[0];
-  audioTrack.onended=()=>{ if(running) stop(); };
-  shareStream.getVideoTracks().forEach(v=>v.onended=()=>{ if(running) stop(); });
+  audioTrack.onended=()=>{ if(running) showWarn("El audio compartido se cortó. Pulsa Detener y luego Iniciar para volver a compartir."); };
+  shareStream.getVideoTracks().forEach(v=>v.onended=()=>{ if(running){ showWarn("Dejaste de compartir la pantalla/pestaña. Pulsa Iniciar para volver a compartir."); stop(); } });
 }
 
 async function start(){
@@ -321,15 +335,15 @@ async function start(){
     .then(()=>{ $("engine").textContent="Motor de traducción: "+(translator?engine:"Servicio en línea (MyMemory / Google)"); })
     .catch(()=>{ translator=null; $("engine").textContent="Motor de traducción: Servicio en línea (MyMemory / Google)"; });
   running=true; gotResult=false; loudSince=0; failCount=0;
-  try{ startRec(); if(audioTrack) startMeter(audioTrack); }
-  catch(e){ if(!$("warn").textContent||$("warn").style.display==="none") showWarn("No se pudo iniciar el reconocimiento de voz ("+e.name+"): "+e.message); running=false; if(shareStream){ shareStream.getTracks().forEach(t=>t.stop()); shareStream=null; } }
+  try{ if(audioTrack) startMeter(audioTrack); startRec(); }
+  catch(e){ if(!$("warn").textContent||$("warn").style.display==="none") showWarn("No se pudo iniciar el reconocimiento de voz ("+e.name+"): "+e.message); stop(); }
   $("btnStart").disabled=false;
   if(running){ $("btnStart").textContent="■ Detener"; $("btnStart").classList.add("on"); setStatus(true,"Escuchando…"); }
 }
 function stop(){
   running=false; clearTimeout(restartTimer);
   if(rec){ rec.onend=null; try{ rec.abort(); }catch(e){} }
-  if(recTrack){ try{ recTrack.stop(); }catch(e){} recTrack=null; }
+  releaseRecTrack();
   if(shareStream){ shareStream.getTracks().forEach(t=>t.stop()); shareStream=null; }
   audioTrack=null; stopMeter();
   clearInterim();
@@ -342,8 +356,9 @@ function updateHeaders(){
   $("hTrad").textContent=`${nameOf(dst.value)} — traducción`;
 }
 updateHeaders();
-[src,dst,$("fuente")].forEach(s=>s.onchange=()=>{ updateHeaders(); if(running){ stop(); start(); } });
-$("btnSwap").onclick=()=>{ [src.value,dst.value]=[dst.value,src.value]; updateHeaders(); if(running){ stop(); start(); } };
+[src,dst].forEach(s=>s.onchange=()=>{ updateHeaders(); if(running){ translator=null; setupTranslator(); scheduleRestart(0); } });
+$("fuente").onchange=()=>{ if(running){ stop(); start(); } };
+$("btnSwap").onclick=()=>{ [src.value,dst.value]=[dst.value,src.value]; updateHeaders(); if(running){ translator=null; setupTranslator(); scheduleRestart(0); } };
 
 /* ---------- Botones extra ---------- */
 const sizes=[18,24,32,44]; let si=0;
