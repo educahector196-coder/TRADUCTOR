@@ -1,0 +1,277 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Traductor en vivo para Teams</title>
+<style>
+  :root{
+    --bg:#0f1115; --panel:#181b22; --line:#2a2f3a; --txt:#e8eaf0; --muted:#8b92a5;
+    --acc:#5b8cff; --ok:#3ecf8e; --rec:#ff5b6b;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;font-family:system-ui,Segoe UI,Roboto,sans-serif;background:var(--bg);color:var(--txt);
+       height:100vh;display:flex;flex-direction:column}
+  header{display:flex;flex-wrap:wrap;gap:10px;align-items:center;padding:12px 16px;border-bottom:1px solid var(--line);background:var(--panel)}
+  header h1{font-size:16px;margin:0 12px 0 0;font-weight:600}
+  select,button{font:inherit;background:#222632;color:var(--txt);border:1px solid var(--line);border-radius:8px;padding:7px 10px}
+  button{cursor:pointer}
+  button:hover{border-color:var(--acc)}
+  #btnStart{background:var(--acc);border-color:var(--acc);font-weight:600;min-width:120px}
+  #btnStart.on{background:var(--rec);border-color:var(--rec)}
+  .arrow{color:var(--muted)}
+  .spacer{flex:1}
+  #status{font-size:13px;color:var(--muted);display:flex;align-items:center;gap:6px}
+  .dot{width:9px;height:9px;border-radius:50%;background:var(--muted)}
+  .dot.on{background:var(--rec);animation:p 1.2s infinite}
+  @keyframes p{50%{opacity:.3}}
+  main{flex:1;display:grid;grid-template-columns:1fr 1fr;gap:1px;background:var(--line);min-height:0}
+  main.solo{grid-template-columns:1fr}
+  main.solo #colOrig{display:none}
+  section{background:var(--bg);display:flex;flex-direction:column;min-height:0}
+  section h2{font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);margin:0;padding:10px 16px;border-bottom:1px solid var(--line)}
+  .feed{flex:1;overflow-y:auto;padding:16px;font-size:var(--fs,20px);line-height:1.45}
+  .line{margin:0 0 .6em}
+  .line .t{font-size:11px;color:var(--muted);margin-right:8px;font-variant-numeric:tabular-nums}
+  .interim{color:var(--muted);font-style:italic}
+  #colTrad .feed{color:#fff}
+  .note{font-size:12px;color:var(--muted);padding:8px 16px;border-top:1px solid var(--line);background:var(--panel)}
+  .warn{background:#3a2a12;color:#ffd38a;padding:10px 16px;font-size:14px;display:none}
+</style>
+</head>
+<body>
+<header>
+  <h1>🎙️ Traductor en vivo</h1>
+  <label>Escuchar
+    <select id="fuente">
+      <option value="sistema">🔊 Audio de Teams / video</option>
+      <option value="mic">🎙️ Mi micrófono</option>
+    </select>
+  </label>
+  <label>Idioma que se escucha
+    <select id="src"></select>
+  </label>
+  <button id="btnSwap" title="Intercambiar idiomas">⇄</button>
+  <label>Traducir a
+    <select id="dst"></select>
+  </label>
+  <button id="btnStart">▶ Iniciar</button>
+  <div id="status"><span class="dot" id="dot"></span><span id="statusTxt">Detenido</span></div>
+  <div class="spacer"></div>
+  <button id="btnSize" title="Tamaño de letra">A↕</button>
+  <button id="btnSolo" title="Mostrar solo la traducción (para compartir pantalla)">Solo traducción</button>
+  <button id="btnCopy">Copiar</button>
+  <button id="btnSave">Descargar .txt</button>
+  <button id="btnClear">Limpiar</button>
+</header>
+<div class="warn" id="warn"></div>
+<main id="main">
+  <section id="colOrig"><h2 id="hOrig">Original</h2><div class="feed" id="orig"></div></section>
+  <section id="colTrad"><h2 id="hTrad">Traducción</h2><div class="feed" id="trad"></div></section>
+</main>
+<div class="note" id="engine">Motor de traducción: —</div>
+
+<script>
+const LANGS = [
+  ["es","es-PE","Español"],["en","en-US","Inglés"],["pt","pt-BR","Portugués"],
+  ["fr","fr-FR","Francés"],["de","de-DE","Alemán"],["it","it-IT","Italiano"],
+  ["zh","zh-CN","Chino"],["ja","ja-JP","Japonés"],["ko","ko-KR","Coreano"],
+  ["ru","ru-RU","Ruso"],["ar","ar-SA","Árabe"],["nl","nl-NL","Neerlandés"]
+];
+const $ = id => document.getElementById(id);
+const src=$("src"), dst=$("dst");
+for (const [c,,n] of LANGS){ src.add(new Option(n,c)); dst.add(new Option(n,c)); }
+src.value="en"; dst.value="es";
+try{ const s=JSON.parse(localStorage.getItem("tt-langs")||"null"); if(s){src.value=s[0];dst.value=s[1];} }catch(e){}
+
+const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+if(!SR){ showWarn("Tu navegador no tiene reconocimiento de voz. Abre esta página en Google Chrome o Microsoft Edge (en computadora)."); $("btnStart").disabled=true; }
+
+let shareStream=null, audioTrack=null;
+let rec=null, running=false, translator=null, engine="", transcript=[];
+let interimOrigEl=null, interimTradEl=null, interimTimer=null, lastInterim="";
+
+function showWarn(m){ const w=$("warn"); w.textContent=m; w.style.display="block"; }
+function hideWarn(){ $("warn").style.display="none"; }
+function setStatus(on,txt){ $("dot").classList.toggle("on",on); $("statusTxt").textContent=txt; }
+function now(){ return new Date().toLocaleTimeString("es-PE",{hour:"2-digit",minute:"2-digit",second:"2-digit"}); }
+function locale(code){ return LANGS.find(l=>l[0]===code)[1]; }
+
+/* ---------- Traducción ---------- */
+async function setupTranslator(){
+  translator=null; engine="";
+  const s=src.value, d=dst.value;
+  if(s===d){ engine="ninguno (mismo idioma)"; return; }
+  // 1) Traductor integrado de Chrome (en el dispositivo, rápido y gratis)
+  if("Translator" in self){
+    try{
+      const av = await Translator.availability({sourceLanguage:s,targetLanguage:d});
+      if(av!=="unavailable"){
+        $("engine").textContent="Preparando traductor del navegador…";
+        translator = await Translator.create({sourceLanguage:s,targetLanguage:d,
+          monitor(m){ m.addEventListener("downloadprogress",e=>{
+            $("engine").textContent=`Descargando paquete de idioma… ${Math.round(e.loaded*100)}%`; }); }});
+        engine="Traductor integrado del navegador (sin internet, en tu PC)";
+        return;
+      }
+    }catch(e){ console.warn("Translator API:",e); }
+  }
+  engine="Servicio en línea (MyMemory / Google)";
+}
+
+async function translate(text){
+  const s=src.value, d=dst.value;
+  if(!text.trim() || s===d) return text;
+  if(translator){ try{ return await translator.translate(text); }catch(e){ console.warn(e); } }
+  // 2) Google (endpoint público)
+  try{
+    const u=`https://translate.googleapis.com/translate_a/single?client=gtx&sl=${s}&tl=${d}&dt=t&q=${encodeURIComponent(text)}`;
+    const r=await fetch(u); if(r.ok){ const j=await r.json(); return j[0].map(x=>x[0]).join(""); }
+  }catch(e){}
+  // 3) MyMemory
+  try{
+    const u=`https://api.mymemory.translated.net/get?q=${encodeURIComponent(text)}&langpair=${s}|${d}`;
+    const j=await (await fetch(u)).json();
+    if(j.responseData && j.responseData.translatedText) return j.responseData.translatedText;
+  }catch(e){}
+  return "[no se pudo traducir]";
+}
+
+/* ---------- Pantalla ---------- */
+function addLine(feed,text,time){
+  const p=document.createElement("p"); p.className="line";
+  p.innerHTML=`<span class="t">${time}</span>`; p.append(document.createTextNode(text));
+  $(feed).append(p); $(feed).scrollTop=$(feed).scrollHeight; return p;
+}
+function setInterim(text){
+  if(!interimOrigEl){ interimOrigEl=document.createElement("p"); interimOrigEl.className="line interim"; $("orig").append(interimOrigEl); }
+  interimOrigEl.textContent=text; $("orig").scrollTop=$("orig").scrollHeight;
+  // traducción provisional solo con el traductor local (rápido)
+  if(translator){
+    clearTimeout(interimTimer); lastInterim=text;
+    interimTimer=setTimeout(async()=>{
+      const t=await translate(text);
+      if(lastInterim!==text) return;
+      if(!interimTradEl){ interimTradEl=document.createElement("p"); interimTradEl.className="line interim"; $("trad").append(interimTradEl); }
+      interimTradEl.textContent=t; $("trad").scrollTop=$("trad").scrollHeight;
+    },250);
+  }
+}
+function clearInterim(){
+  clearTimeout(interimTimer); lastInterim="";
+  interimOrigEl?.remove(); interimTradEl?.remove(); interimOrigEl=interimTradEl=null;
+}
+async function onFinal(text){
+  text=text.trim(); if(!text) return;
+  clearInterim();
+  const time=now();
+  addLine("orig",text,time);
+  const placeholder=addLine("trad","…",time);
+  const t=await translate(text);
+  placeholder.lastChild.textContent=t;
+  $("trad").scrollTop=$("trad").scrollHeight;
+  transcript.push({time,text,t});
+}
+
+/* ---------- Reconocimiento de voz ---------- */
+function startRec(){
+  rec=new SR();
+  rec.lang=locale(src.value);
+  rec.continuous=true;
+  rec.interimResults=true;
+  rec.onresult=e=>{
+    let interim="";
+    for(let i=e.resultIndex;i<e.results.length;i++){
+      const r=e.results[i];
+      if(r.isFinal) onFinal(r[0].transcript); else interim+=r[0].transcript;
+    }
+    if(interim) setInterim(interim);
+  };
+  rec.onerror=e=>{
+    if(e.error==="not-allowed"||e.error==="service-not-allowed"){
+      showWarn("El navegador no dio permiso al micrófono. Haz clic en el candado de la barra de direcciones → Micrófono → Permitir, y vuelve a iniciar.");
+      stop();
+    }else if(e.error==="audio-capture"){
+      showWarn("No se encontró micrófono. Revisa que esté conectado y seleccionado en Windows.");
+      stop();
+    }else if(e.error==="network"){
+      showWarn("El reconocimiento de voz de Chrome/Edge necesita internet. Revisa tu conexión.");
+    }
+  };
+  // Chrome corta la escucha cada cierto tiempo: la reiniciamos sola
+  rec.onend=()=>{ if(running){ try{ go(); }catch(e){ setTimeout(()=>running&&startRec(),300); } } };
+  go();
+}
+function go(){
+  if(audioTrack && audioTrack.readyState==="live") rec.start(audioTrack); else rec.start();
+}
+
+/* Capturar el audio de Teams o de un video compartiendo pantalla/pestaña */
+async function captureSystemAudio(){
+  if(!navigator.mediaDevices?.getDisplayMedia) throw new Error("Tu navegador no permite capturar audio de pantalla.");
+  shareStream = await navigator.mediaDevices.getDisplayMedia({
+    video:true,
+    audio:{echoCancellation:false,noiseSuppression:false,autoGainControl:false},
+    systemAudio:"include", selfBrowserSurface:"exclude"
+  });
+  const tracks=shareStream.getAudioTracks();
+  if(!tracks.length){
+    shareStream.getTracks().forEach(t=>t.stop()); shareStream=null;
+    throw new Error("No se compartió audio. Vuelve a iniciar y, en la ventana para compartir, marca la casilla «Compartir audio del sistema» (pantalla completa) o «Compartir audio de la pestaña».");
+  }
+  audioTrack=tracks[0];
+  audioTrack.onended=()=>{ if(running) stop(); };
+  shareStream.getVideoTracks().forEach(v=>v.onended=()=>{ if(running) stop(); });
+}
+
+async function start(){
+  hideWarn();
+  try{ localStorage.setItem("tt-langs",JSON.stringify([src.value,dst.value])); }catch(e){}
+  $("btnStart").disabled=true; setStatus(false,"Preparando…");
+  audioTrack=null;
+  if($("fuente").value==="sistema"){
+    try{ await captureSystemAudio(); }
+    catch(e){
+      showWarn(e.name==="NotAllowedError" ? "Cancelaste la ventana para compartir. Pulsa Iniciar otra vez y elige qué compartir." : e.message);
+      $("btnStart").disabled=false; setStatus(false,"Detenido"); return;
+    }
+  }
+  await setupTranslator();
+  $("engine").textContent="Motor de traducción: "+engine;
+  running=true;
+  try{ startRec(); }catch(e){ showWarn("No se pudo iniciar el micrófono: "+e.message); running=false; }
+  $("btnStart").disabled=false;
+  if(running){ $("btnStart").textContent="■ Detener"; $("btnStart").classList.add("on"); setStatus(true,"Escuchando…"); }
+}
+function stop(){
+  running=false; try{ rec&&rec.stop(); }catch(e){}
+  if(shareStream){ shareStream.getTracks().forEach(t=>t.stop()); shareStream=null; }
+  audioTrack=null;
+  clearInterim();
+  $("btnStart").textContent="▶ Iniciar"; $("btnStart").classList.remove("on"); setStatus(false,"Detenido");
+}
+$("btnStart").onclick=()=> running?stop():start();
+function nameOf(c){ return LANGS.find(l=>l[0]===c)[2]; }
+function updateHeaders(){
+  $("hOrig").textContent=`${nameOf(src.value)} — lo que se dice`;
+  $("hTrad").textContent=`${nameOf(dst.value)} — traducción`;
+}
+updateHeaders();
+[src,dst,$("fuente")].forEach(s=>s.onchange=()=>{ updateHeaders(); if(running){ stop(); start(); } });
+$("btnSwap").onclick=()=>{ [src.value,dst.value]=[dst.value,src.value]; updateHeaders(); if(running){ stop(); start(); } };
+
+/* ---------- Botones extra ---------- */
+const sizes=[18,24,32,44]; let si=0;
+$("btnSize").onclick=()=>{ si=(si+1)%sizes.length; document.body.style.setProperty("--fs",sizes[si]+"px"); };
+$("btnSolo").onclick=()=>{ const m=$("main").classList.toggle("solo"); $("btnSolo").textContent=m?"Ver ambos":"Solo traducción"; };
+function asText(){ return transcript.map(x=>`[${x.time}] ${x.text}\n        → ${x.t}`).join("\n"); }
+$("btnCopy").onclick=async()=>{ try{ await navigator.clipboard.writeText(asText()); $("btnCopy").textContent="¡Copiado!"; setTimeout(()=>$("btnCopy").textContent="Copiar",1500);}catch(e){} };
+$("btnSave").onclick=()=>{
+  const a=document.createElement("a");
+  a.href=URL.createObjectURL(new Blob([asText()],{type:"text/plain"}));
+  a.download=`traduccion-${new Date().toISOString().slice(0,16).replace(/[:T]/g,"-")}.txt`; a.click();
+};
+$("btnClear").onclick=()=>{ $("orig").innerHTML=""; $("trad").innerHTML=""; transcript=[]; };
+</script>
+</body>
+</html>
