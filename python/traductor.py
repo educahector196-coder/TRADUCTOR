@@ -156,9 +156,19 @@ class Segmentador(threading.Thread):
         self.cola_frases = cola_frases
         self.app = app
 
+    piso = 0.0005   # ruido de fondo estimado (se ajusta solo)
+
     def umbral(self):
         s = self.app.sens_val                    # 1..10 (copiado desde la ventana)
-        return 0.03 * (0.68 ** (s - 1))         # más sensibilidad = umbral más bajo
+        factor = 6.0 - 0.45 * (s - 1)            # sens 1 -> 6x el ruido · sens 10 -> ~2x el ruido
+        return max(0.0004, self.piso * factor, 0.012 * (0.62 ** (s - 1)) if s < 3 else 0.0)
+
+    def _ajustar_piso(self, nivel):
+        # sube despacio y baja rápido: sigue al silencio de fondo, no a la voz
+        if nivel < self.piso:
+            self.piso = 0.7 * self.piso + 0.3 * max(nivel, 0.0001)
+        else:
+            self.piso = 0.998 * self.piso + 0.002 * nivel
 
     def _run(self):
         buf, dur = [], 0.0
@@ -178,6 +188,9 @@ class Segmentador(threading.Thread):
             if x is not None and len(x):
                 nivel = float(np.sqrt(np.mean(x * x)))
                 self.app.nivel = nivel
+                self.app.umbral_actual = self.umbral()
+                if not hablando:
+                    self._ajustar_piso(nivel)
                 if nivel > self.umbral():
                     if not hablando:
                         buf = list(previo); dur = sum(len(b) for b in buf) / SR
@@ -288,7 +301,7 @@ class App:
         self.cola_ui = queue.Queue()
         self.nivel = 0.0
         self.fuente = 20
-        self.sens_val, self.src_code, self.dst_code = 6.0, "en", "es"
+        self.sens_val, self.src_code, self.dst_code = 8.0, "en", "es"
         self.frases_detectadas = 0
         self.archivo = self._archivo_nuevo()
 
@@ -313,7 +326,7 @@ class App:
             cb.bind("<<ComboboxSelected>>", lambda e: self._titulos())
 
         tk.Label(barra, text="   Sensibilidad", **estilo).pack(side="left")
-        self.sensibilidad = tk.DoubleVar(value=6)
+        self.sensibilidad = tk.DoubleVar(value=8)
         tk.Scale(barra, from_=1, to=10, resolution=0.5, orient="horizontal", variable=self.sensibilidad,
                  length=110, showvalue=False, bg=self.PANEL, fg=self.TXT, highlightthickness=0,
                  troughcolor="#222632").pack(side="left")
@@ -473,9 +486,12 @@ class App:
             pass
         # medidor de nivel y línea del umbral
         w = 120
-        self.medidor.coords(self.barra_nivel, 0, 0, min(w, self.nivel * 2000), 10)
-        umbral = 0.03 * (0.68 ** (self.sens_val - 1))
-        x = min(w - 1, umbral * 2000)
+        import math
+        def px(v):  # 0.0001 -> 0 · 0.3 -> w (escala logarítmica)
+            return max(0, min(w, (math.log10(max(v, 1e-4)) + 4) / 3.5 * w))
+        self.medidor.coords(self.barra_nivel, 0, 0, px(self.nivel), 10)
+        umbral = getattr(self, "umbral_actual", 0.002)
+        x = min(w - 1, px(umbral))
         self.medidor.coords(self.linea_umbral, x, 0, x, 10)
         self.lbl_frases.config(text=f"Frases detectadas: {self.frases_detectadas}")
         self.root.after(60, self._tick)
