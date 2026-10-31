@@ -3,3 +3,4 @@ PyAudioWPatch
 faster-whisper
 deep-translator
 truststore
+anthropic

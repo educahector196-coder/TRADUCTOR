@@ -31,6 +31,12 @@ from tkinter import ttk
 MODELO = "base"         # "tiny" = rapidísimo · "base" = rápido (recomendado) · "small" = más preciso pero lento
 FRAGMENTO_MAX = 4.0     # segundos máximos por frase antes de transcribir (menos = aparece antes)
 PAUSA_FIN_FRASE = 0.45  # segundos de silencio que marcan el fin de una frase
+
+# --- IA (Claude) ---
+IA_ACTIVA = True                      # False = solo Google, sin IA
+MODELO_IA_RAPIDO = "claude-haiku-5-5"   # traducción frase por frase (rápido y barato)
+MODELO_IA_LISTO = "claude-sonnet-5-5"   # respuestas sugeridas y resumen
+MI_NOMBRE = "Héctor"
 # =============================================================
 
 IDIOMAS = {
@@ -244,6 +250,7 @@ class Transcriptor(threading.Thread):
                 time.sleep(5)
         self.app.estado_modelo("✅ Modelo de voz listo")
         n = 0
+        recientes = collections.deque(maxlen=6)
         while True:
             hora, audio = self.cola_frases.get()
             partes = [audio]
@@ -277,6 +284,9 @@ class Transcriptor(threading.Thread):
             n += 1
             self.app.cola_ui.put(("orig", n, hora, texto))
             self.cola_trad.put((n, hora, texto))
+            if self.app.ia:
+                self.app.ia.mejorar(n, hora, texto, recientes, self.app.idioma_origen(), self.app.idioma_destino())
+            recientes.append(texto)
 
 
 # Usar los certificados de Windows: así las conexiones seguras funcionan
@@ -367,6 +377,120 @@ class Traductor(threading.Thread):
 
 
 # ---------------------------------------------------------------------------
+# 4b) IA (Claude): traducción con contexto, respuestas sugeridas y resumen
+# ---------------------------------------------------------------------------
+RUTA_CLAVE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "clave_api.txt")
+
+
+def leer_clave():
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        return os.environ["ANTHROPIC_API_KEY"].strip()
+    try:
+        with open(RUTA_CLAVE, encoding="utf-8") as f:
+            return f.read().strip() or None
+    except Exception:
+        return None
+
+
+class IA:
+    def __init__(self, app):
+        self.app = app
+        self.cliente = None
+        self.cola = queue.Queue()
+        self.conectar()
+        for _ in range(3):  # 3 traducciones IA en paralelo
+            threading.Thread(target=self._trabajar, daemon=True).start()
+
+    def conectar(self):
+        clave = leer_clave()
+        if not (IA_ACTIVA and clave):
+            self.cliente = None
+            return False
+        try:
+            import anthropic
+            self.cliente = anthropic.Anthropic(api_key=clave, max_retries=1, timeout=12)
+            return True
+        except Exception as e:
+            log(f"IA no disponible: {e}")
+            self.cliente = None
+            return False
+
+    def _pedir(self, modelo, sistema, texto, max_tokens):
+        r = self.cliente.messages.create(model=modelo, max_tokens=max_tokens, system=sistema,
+                                         messages=[{"role": "user", "content": texto}])
+        return "".join(getattr(b, "text", "") for b in r.content).strip()
+
+    # --- traducción frase a frase con contexto ---
+    def mejorar(self, n, hora, texto, contexto, src, dst):
+        if self.cliente:
+            self.cola.put((n, hora, texto, list(contexto), src, dst))
+
+    def _trabajar(self):
+        while True:
+            n, hora, texto, contexto, src, dst = self.cola.get()
+            if self.cola.qsize() > 6:   # si se acumula, saltar para no atrasarse (queda la de Google)
+                continue
+            nombres = {v: k for k, v in IDIOMAS.items()}
+            sistema = (f"Eres intérprete en vivo en una reunión de Microsoft Teams. Traduces del "
+                       f"{nombres.get(src, src)} al {nombres.get(dst, dst)} para {MI_NOMBRE}, que necesita entender "
+                       "EXACTAMENTE qué se dijo para responder bien. El texto viene de reconocimiento de voz "
+                       "y puede tener errores: corrígelos usando el contexto. Traduce de forma natural y fiel, "
+                       "sin agregar nada. Si la frase es una pregunta o pedido dirigido a alguien, mantenlo claro. "
+                       "Responde SOLO con la traducción, sin comillas ni explicaciones.")
+            ctx = "\n".join(contexto[-6:])
+            prompt = (f"Contexto (frases anteriores):\n{ctx}\n\n" if ctx else "") + f"Frase a traducir:\n{texto}"
+            try:
+                t0 = time.time()
+                trad = self._pedir(MODELO_IA_RAPIDO, sistema, prompt, 300)
+                if trad:
+                    log(f"   ✨ {trad}  ({time.time() - t0:.1f}s)")
+                    self.app.cola_ui.put(("trad_ia", n, hora, trad))
+            except Exception as e:
+                log(f"   (IA no respondió, queda la traducción de Google: {type(e).__name__})")
+
+    # --- respuestas sugeridas y resumen (se piden con botón) ---
+    def en_hilo(self, tipo, historial, src, dst):
+        if not self.cliente:
+            self.app.cola_ui.put(("ia_panel", 0, "", "🔑 Falta la clave de la IA. Pulsa «🔑 Clave IA» y pégala."))
+            return
+        threading.Thread(target=self._panel, args=(tipo, historial, src, dst), daemon=True).start()
+
+    def _panel(self, tipo, historial, src, dst):
+        nombres = {v: k for k, v in IDIOMAS.items()}
+        lengua_reunion, mi_lengua = nombres.get(src, src), nombres.get(dst, dst)
+        trans = "\n".join(f"[{h}] {o}" for h, o in historial[-40 if tipo == "responder" else -400:])
+        if not trans.strip():
+            self.app.cola_ui.put(("ia_panel", 0, "", "Todavía no hay nada transcrito en la reunión."))
+            return
+        if tipo == "responder":
+            self.app.cola_ui.put(("ia_panel", 0, "", "💡 Pensando qué puedes responder…"))
+            sistema = (f"Ayudas a {MI_NOMBRE}, estudiante de Derecho peruano, en una reunión de Teams en "
+                       f"{lengua_reunion}. Su idioma es el {mi_lengua} y su nivel de {lengua_reunion} es básico.")
+            prompt = (f"Transcripción reciente de la reunión:\n{trans}\n\n"
+                      f"1) En una línea en {mi_lengua}: qué le están preguntando o pidiendo a {MI_NOMBRE} "
+                      "(o qué se está discutiendo ahora).\n"
+                      f"2) Tres respuestas cortas y naturales en {lengua_reunion} que {MI_NOMBRE} pueda decir "
+                      "(una positiva, una neutral/pedir aclaración, una alternativa). Para cada una: la frase, "
+                      f"su significado en {mi_lengua} y la pronunciación aproximada para hispanohablante.\n"
+                      "Formato breve, sin introducciones.")
+            maxt = 600
+        else:
+            self.app.cola_ui.put(("ia_panel", 0, "", "📋 Haciendo el resumen…"))
+            sistema = f"Resumes reuniones de Teams para {MI_NOMBRE}. Escribes en {mi_lengua}, claro y breve."
+            prompt = (f"Transcripción (puede tener errores de reconocimiento de voz):\n{trans}\n\n"
+                      "Haz un resumen con: Temas tratados · Acuerdos/decisiones · Tareas (quién/qué/cuándo) · "
+                      f"Preguntas pendientes o cosas que {MI_NOMBRE} debe responder. Usa viñetas cortas.")
+            maxt = 1200
+        try:
+            out = self._pedir(MODELO_IA_LISTO, sistema, prompt, maxt)
+            self.app.cola_ui.put(("ia_panel", 0, "", out))
+            self.app._guardar_texto(("\n=== RESPUESTAS SUGERIDAS ===\n" if tipo == "responder"
+                                     else "\n=== RESUMEN ===\n") + out + "\n")
+        except Exception as e:
+            self.app.cola_ui.put(("ia_panel", 0, "", f"No se pudo consultar a la IA ({type(e).__name__}: {str(e)[:150]})"))
+
+
+# ---------------------------------------------------------------------------
 # 5) VENTANA
 # ---------------------------------------------------------------------------
 class App:
@@ -378,11 +502,12 @@ class App:
         self.nivel = 0.0
         self.fuente = 20
         self.sens_val, self.src_code, self.dst_code = 8.0, "en", "es"
+        self.ia = None
         self.frases_detectadas = 0
         self.archivo = self._archivo_nuevo()
 
         root.title("Traductor en vivo — Teams")
-        root.geometry("1200x650")
+        root.geometry("1250x780")
         root.configure(bg=self.BG)
         root.protocol("WM_DELETE_WINDOW", self._cerrar)
 
@@ -424,7 +549,6 @@ class App:
                        ).pack(side="right", padx=6)
 
         self.panel = tk.PanedWindow(root, orient="horizontal", bg="#2a2f3a", sashwidth=2, bd=0)
-        self.panel.pack(fill="both", expand=True)
         self.col_orig, self.txt_orig, self.tit_orig = self._columna()
         self.col_trad, self.txt_trad, self.tit_trad = self._columna()
         self.panel.add(self.col_orig, stretch="always")
@@ -433,7 +557,27 @@ class App:
         self.solo = False
 
         pie = tk.Frame(root, bg=self.PANEL, padx=10, pady=4)
-        pie.pack(fill="x")
+        pie.pack(fill="x", side="bottom")
+
+        # --- panel del asistente IA ---
+        caja = tk.Frame(root, bg=self.PANEL)
+        caja.pack(fill="x", side="bottom")
+        fila = tk.Frame(caja, bg=self.PANEL, padx=10, pady=4)
+        fila.pack(fill="x")
+        tk.Label(fila, text="🤖 Asistente IA", bg=self.PANEL, fg=self.TXT, font=("Segoe UI", 10, "bold")).pack(side="left")
+        for txt, cmd in (("💡 ¿Qué respondo?  (F2)", lambda: self._pedir_ia("responder")),
+                         ("📋 Resumen  (F3)", lambda: self._pedir_ia("resumen")),
+                         ("🔑 Clave IA", self._clave)):
+            tk.Button(fila, text=txt, command=cmd, bg="#2d3550", fg=self.TXT, relief="flat", padx=10).pack(side="left", padx=4)
+        self.lbl_ia = tk.Label(fila, text="", bg=self.PANEL, fg=self.MUTED, font=("Segoe UI", 9))
+        self.lbl_ia.pack(side="left", padx=10)
+        self.txt_ia = tk.Text(caja, height=7, bg="#121a2b", fg="#dfe8ff", font=("Segoe UI", 12), wrap="word",
+                              relief="flat", padx=14, pady=6)
+        self.txt_ia.pack(fill="x")
+        self.txt_ia.insert("end", "Aquí aparecerán las respuestas sugeridas y el resumen.")
+        self.txt_ia.configure(state="disabled")
+        root.bind("<F2>", lambda e: self._pedir_ia("responder"))
+        root.bind("<F3>", lambda e: self._pedir_ia("resumen"))
         self.lbl_audio = tk.Label(pie, text="Iniciando audio…", bg=self.PANEL, fg=self.MUTED, font=("Segoe UI", 9))
         self.lbl_audio.pack(side="left")
         self.lbl_modelo = tk.Label(pie, text="", bg=self.PANEL, fg=self.MUTED, font=("Segoe UI", 9))
@@ -443,6 +587,10 @@ class App:
         tk.Label(pie, text=f"Se guarda en: {os.path.relpath(self.archivo)}", bg=self.PANEL, fg=self.MUTED,
                  font=("Segoe UI", 9)).pack(side="right")
 
+        self.panel.pack(fill="both", expand=True)   # columnas en el espacio que queda
+        self.historial = []                          # (hora, texto original)
+        self.ia = IA(self)
+        self.lbl_ia.config(text="✅ IA conectada" if self.ia.cliente else "IA apagada: pulsa «🔑 Clave IA»")
         self._copiar_controles()
         # hilos de trabajo
         cola_audio, cola_frases, cola_trad = queue.Queue(maxsize=2000), queue.Queue(), queue.Queue()
@@ -461,6 +609,7 @@ class App:
                       relief="flat", padx=14, pady=8, insertbackground=self.TXT, spacing3=8)
         txt.pack(fill="both", expand=True)
         txt.tag_configure("hora", foreground=self.MUTED, font=("Segoe UI", 9))
+        txt.tag_configure("ia", foreground="#bfe3ff")
         txt.configure(state="disabled")
         return marco, txt, tit
 
@@ -513,6 +662,31 @@ class App:
         os.makedirs(carpeta, exist_ok=True)
         return os.path.join(carpeta, "reunion-" + datetime.datetime.now().strftime("%Y-%m-%d_%H-%M") + ".txt")
 
+    def _pedir_ia(self, tipo):
+        self.ia.en_hilo(tipo, list(self.historial), self.src_code, self.dst_code)
+
+    def _clave(self):
+        from tkinter import simpledialog, messagebox
+        k = simpledialog.askstring("Clave de la IA", "Pega tu clave de API de Anthropic (empieza con sk-ant-):",
+                                   parent=self.root, show="•")
+        if not k:
+            return
+        try:
+            with open(RUTA_CLAVE, "w", encoding="utf-8") as f:
+                f.write(k.strip())
+        except Exception as e:
+            messagebox.showerror("Clave", f"No se pudo guardar: {e}")
+            return
+        ok = self.ia.conectar()
+        self.lbl_ia.config(text="✅ IA conectada" if ok else "❌ No se pudo conectar la IA")
+
+    def _guardar_texto(self, texto):
+        try:
+            with open(self.archivo, "a", encoding="utf-8") as f:
+                f.write(texto)
+        except Exception:
+            pass
+
     def _guardar(self, hora, orig, trad):
         try:
             with open(self.archivo, "a", encoding="utf-8") as f:
@@ -542,6 +716,7 @@ class App:
             while True:
                 tipo, n, hora, texto = self.cola_ui.get_nowait()
                 if tipo == "orig":
+                    self.historial.append((hora, texto))
                     self._escribir(self.txt_orig, n, hora, texto)
                     self._escribir(self.txt_trad, n, hora, "…")
                     self._pendiente = getattr(self, "_pendiente", {}); self._pendiente[n] = texto
@@ -549,11 +724,24 @@ class App:
                     t = self.txt_trad
                     rng = t.tag_ranges(f"n{n}")
                     t.configure(state="normal")
+                    if rng and t.get(rng[0], rng[1]).startswith("✨"):
+                        rng = None
                     if rng:
                         t.delete(rng[0], rng[1]); t.insert(rng[0], texto, (f"n{n}",))
                     t.configure(state="disabled"); t.see("end")
                     orig = getattr(self, "_pendiente", {}).pop(n, "")
                     self._guardar(hora, orig, texto)
+                elif tipo == "trad_ia":
+                    t = self.txt_trad
+                    rng = t.tag_ranges(f"n{n}")
+                    t.configure(state="normal")
+                    if rng:
+                        t.delete(rng[0], rng[1]); t.insert(rng[0], "✨ " + texto, (f"n{n}", "ia"))
+                    t.configure(state="disabled")
+                    self._guardar_texto(f"           ✨ {texto}\n")
+                elif tipo == "ia_panel":
+                    self.txt_ia.configure(state="normal"); self.txt_ia.delete("1.0", "end")
+                    self.txt_ia.insert("end", texto); self.txt_ia.configure(state="disabled")
                 elif tipo == "estado_audio":
                     self.lbl_audio.config(text=texto)
                 elif tipo == "estado_modelo":
