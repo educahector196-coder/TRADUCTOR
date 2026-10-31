@@ -62,6 +62,9 @@
   <button id="btnStart">▶ Iniciar</button>
   <div id="status"><span class="dot" id="dot"></span><span id="statusTxt">Detenido</span></div>
   <div class="spacer"></div>
+  <label title="Sube si no capta voces bajas; baja si capta mucho ruido">Sensibilidad
+    <input type="range" id="gain" min="1" max="10" step="0.5" value="3" style="width:90px;vertical-align:middle"> <span id="gainVal">3x</span>
+  </label>
   <button id="btnSize" title="Tamaño de letra">A↕</button>
   <button id="btnSolo" title="Mostrar solo la traducción (para compartir pantalla)">Solo traducción</button>
   <button id="btnCopy">Copiar</button>
@@ -211,6 +214,7 @@ function startRec(){
   rec.lang=locale(src.value);
   rec.continuous=true;
   rec.interimResults=true;
+  rec.maxAlternatives=1;
   rec.onstart=rec.onaudiostart=()=>{ lastActivity=Date.now(); };
   rec.onresult=e=>{
     gotResult=true; lastActivity=Date.now(); failCount=0;
@@ -261,13 +265,24 @@ setInterval(()=>{
 },3000);
 
 /* ---------- Medidor de audio (para saber si llega sonido) ---------- */
-let shareNode=null, bridgeDest=null;
+let shareNode=null, bridgeDest=null, gainNode=null;
+function gainValue(){ return parseFloat($("gain").value)||3; }
+function buildChain(track){
+  audioCtx=audioCtx||new (window.AudioContext||window.webkitAudioContext)();
+  audioCtx.resume&&audioCtx.resume();
+  const srcN=audioCtx.createMediaStreamSource(new MediaStream([track]));
+  const hp=audioCtx.createBiquadFilter(); hp.type="highpass"; hp.frequency.value=85;      // quita zumbidos graves
+  const pres=audioCtx.createBiquadFilter(); pres.type="peaking"; pres.frequency.value=2500; pres.Q.value=0.8; pres.gain.value=4; // realza claridad de la voz
+  gainNode=audioCtx.createGain(); gainNode.gain.value=gainValue();
+  const comp=audioCtx.createDynamicsCompressor();
+  comp.threshold.value=-30; comp.knee.value=20; comp.ratio.value=6; comp.attack.value=0.003; comp.release.value=0.25;
+  srcN.connect(hp); hp.connect(pres); pres.connect(gainNode); gainNode.connect(comp);
+  shareNode=comp;
+  return comp;
+}
 function bridgeTrack(){
   if(!audioCtx||!shareNode){
-    try{
-      audioCtx=audioCtx||new (window.AudioContext||window.webkitAudioContext)();
-      shareNode=audioCtx.createMediaStreamSource(new MediaStream([audioTrack]));
-    }catch(e){ return audioTrack.clone(); }
+    try{ buildChain(audioTrack); }catch(e){ return audioTrack.clone(); }
   }
   if(audioCtx.state==="suspended") audioCtx.resume();
   bridgeDest=audioCtx.createMediaStreamDestination();
@@ -281,11 +296,8 @@ function releaseRecTrack(){
 let audioCtx=null, meterRAF=null, gotResult=false, loudSince=0;
 function startMeter(track){
   try{
-    audioCtx=new (window.AudioContext||window.webkitAudioContext)();
-    audioCtx.resume&&audioCtx.resume();
-    const srcNode=audioCtx.createMediaStreamSource(new MediaStream([track]));
-    shareNode=srcNode;
-    const an=audioCtx.createAnalyser(); an.fftSize=512; srcNode.connect(an);
+    const out=buildChain(track);
+    const an=audioCtx.createAnalyser(); an.fftSize=512; out.connect(an);
     const buf=new Uint8Array(an.fftSize);
     $("meterBox").style.display="flex";
     const tick=()=>{
@@ -413,6 +425,12 @@ async function start(){
       setTimeout(()=>note("No se pudo abrir el sonido de la PC ("+e.name+"): escuchando por el micrófono."),50);
       $("help").style.display="block";
     }
+  } else if($("fuente").value==="mic"){
+    try{
+      devStream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:true,autoGainControl:true}});
+      audioTrack=devStream.getAudioTracks()[0];
+      audioTrack.onended=()=>{ if(running){ releaseRecTrack(); stopMeter(); audioTrack=null; scheduleRestart(0); } };
+    }catch(e){ audioTrack=null; }
   } else if($("fuente").value==="sistema"){
     try{ await captureSystemAudio(); }
     catch(e){
@@ -474,6 +492,9 @@ $("btnSwap").onclick=()=>{ [src.value,dst.value]=[dst.value,src.value]; updateHe
 
 /* ---------- Botones extra ---------- */
 const sizes=[18,24,32,44]; let si=0;
+try{ const g=localStorage.getItem("tt-gain"); if(g) $("gain").value=g; }catch(e){}
+$("gainVal").textContent=$("gain").value+"x";
+$("gain").oninput=()=>{ $("gainVal").textContent=$("gain").value+"x"; if(gainNode) gainNode.gain.value=gainValue(); try{ localStorage.setItem("tt-gain",$("gain").value); }catch(e){} };
 $("btnSize").onclick=()=>{ si=(si+1)%sizes.length; document.body.style.setProperty("--fs",sizes[si]+"px"); };
 $("btnSolo").onclick=()=>{ const m=$("main").classList.toggle("solo"); $("btnSolo").textContent=m?"Ver ambos":"Solo traducción"; };
 function asText(){ return transcript.map(x=>`[${x.time}] ${x.text}\n        → ${x.t}`).join("\n"); }
