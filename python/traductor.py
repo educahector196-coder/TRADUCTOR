@@ -28,9 +28,9 @@ import tkinter as tk
 from tkinter import ttk
 
 # ======================= CONFIGURACIÓN =======================
-MODELO = "small"        # "base" = más rápido (laptop lenta) · "small" = equilibrio · "medium" = más preciso (lento)
-FRAGMENTO_MAX = 7.0     # segundos máximos por frase antes de transcribir
-PAUSA_FIN_FRASE = 0.7   # segundos de silencio que marcan el fin de una frase
+MODELO = "base"         # "tiny" = rapidísimo · "base" = rápido (recomendado) · "small" = más preciso pero lento
+FRAGMENTO_MAX = 4.0     # segundos máximos por frase antes de transcribir (menos = aparece antes)
+PAUSA_FIN_FRASE = 0.45  # segundos de silencio que marcan el fin de una frase
 # =============================================================
 
 IDIOMAS = {
@@ -237,7 +237,8 @@ class Transcriptor(threading.Thread):
         modelo = None
         while modelo is None:
             try:
-                modelo = WhisperModel(MODELO, device="cpu", compute_type="int8")
+                modelo = WhisperModel(MODELO, device="cpu", compute_type="int8",
+                                      cpu_threads=max(2, (os.cpu_count() or 4) - 1))
             except Exception as e:
                 self.app.estado_modelo(f"🔁 Reintentando cargar el modelo… ({e})")
                 time.sleep(5)
@@ -245,12 +246,25 @@ class Transcriptor(threading.Thread):
         n = 0
         while True:
             hora, audio = self.cola_frases.get()
-            if self.cola_frases.qsize() > 3:
-                self.app.estado_modelo("⚠️ La PC va lenta: abre traductor.py y cambia MODELO a \"base\"")
+            partes = [audio]
+            while not self.cola_frases.empty() and sum(len(p) for p in partes) < SR * 15:
+                _, extra = self.cola_frases.get_nowait()
+                partes.append(extra)
+            if len(partes) > 1:
+                audio = np.concatenate(partes)
+                log(f"   (poniéndose al día: {len(partes)} frases juntas)")
             try:
-                segs, _ = modelo.transcribe(audio, language=self.app.idioma_origen(), beam_size=2,
-                                            vad_filter=True, condition_on_previous_text=False,
+                t0 = time.time()
+                segs, _ = modelo.transcribe(audio, language=self.app.idioma_origen(), beam_size=1,
+                                            best_of=1, temperature=0.0, vad_filter=False,
+                                            without_timestamps=True, condition_on_previous_text=False,
                                             no_speech_threshold=0.6)
+                segs = list(segs)
+                tarda = time.time() - t0
+                if tarda > len(audio) / SR:
+                    self.app.estado_modelo(f"⚠️ La PC tarda {tarda:.1f}s por frase: si se atrasa, pon MODELO = \"tiny\"")
+                else:
+                    self.app.estado_modelo(f"✅ Velocidad OK ({tarda:.1f}s por frase)")
                 texto = " ".join(s.text.strip() for s in segs
                                  if not (s.no_speech_prob > 0.6 and s.avg_logprob < -1.0)).strip()
             except Exception as e:
@@ -280,7 +294,7 @@ import urllib.request
 
 def _get_json(url):
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-    with urllib.request.urlopen(req, timeout=8) as r:
+    with urllib.request.urlopen(req, timeout=3) as r:
         return json.loads(r.read().decode("utf-8"))
 
 
@@ -335,7 +349,11 @@ class Traductor(threading.Thread):
 
     def run(self):
         while True:
-            n, hora, texto = self.cola_trad.get()
+            item = self.cola_trad.get()
+            threading.Thread(target=self._una, args=item, daemon=True).start()
+
+    def _una(self, n, hora, texto):
+        if True:
             src, dst = self.app.idioma_origen(), self.app.idioma_destino()
             trad = texto if src == dst else None
             for intento in range(3):
