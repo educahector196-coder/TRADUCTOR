@@ -265,26 +265,84 @@ class Transcriptor(threading.Thread):
             self.cola_trad.put((n, hora, texto))
 
 
+# Usar los certificados de Windows: así las conexiones seguras funcionan
+# aunque un antivirus (McAfee, Kaspersky…) inspeccione el tráfico.
+try:
+    import truststore
+    truststore.inject_into_ssl()
+except Exception:
+    pass
+
+import json
+import urllib.parse
+import urllib.request
+
+
+def _get_json(url):
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=8) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
+def _google(texto, src, dst):
+    url = ("https://translate.googleapis.com/translate_a/single?client=gtx&dt=t"
+           f"&sl={src}&tl={dst}&q=" + urllib.parse.quote(texto))
+    j = _get_json(url)
+    return "".join(p[0] for p in j[0] if p and p[0])
+
+
+def _mymemory(texto, src, dst):
+    url = ("https://api.mymemory.translated.net/get?langpair="
+           + urllib.parse.quote(f"{src}|{dst}") + "&q=" + urllib.parse.quote(texto))
+    j = _get_json(url)
+    t = j.get("responseData", {}).get("translatedText")
+    if not t or "MYMEMORY WARNING" in t:
+        raise RuntimeError("MyMemory sin respuesta")
+    return t
+
+
+def _deep(texto, src, dst):
+    from deep_translator import GoogleTranslator
+    return GoogleTranslator(source=src, target=dst).translate(texto)
+
+
+RUTAS = [("Google", _google), ("Google (librería)", _deep), ("MyMemory", _mymemory)]
+
+
 class Traductor(threading.Thread):
     def __init__(self, cola_trad, app):
         super().__init__(daemon=True)
         self.cola_trad = cola_trad
         self.app = app
+        self.ruta_buena = 0   # recuerda qué servicio funcionó
+
+    def traducir(self, texto, src, dst):
+        orden = list(range(self.ruta_buena, len(RUTAS))) + list(range(0, self.ruta_buena))
+        errores = []
+        for i in orden:
+            nombre, fn = RUTAS[i]
+            try:
+                t = fn(texto, src, dst)
+                if t:
+                    if i != self.ruta_buena:
+                        self.ruta_buena = i
+                        self.app.estado_modelo(f"🌎 Traduciendo con: {nombre}")
+                    return t
+            except Exception as e:
+                errores.append(f"{nombre}: {type(e).__name__} {str(e)[:100]}")
+        log("   ❌ No se pudo traducir. Detalles: " + " | ".join(errores))
+        return None
 
     def run(self):
-        from deep_translator import GoogleTranslator
         while True:
             n, hora, texto = self.cola_trad.get()
             src, dst = self.app.idioma_origen(), self.app.idioma_destino()
-            trad = None
-            if src == dst:
-                trad = texto
-            for intento in range(4):
+            trad = texto if src == dst else None
+            for intento in range(3):
                 if trad:
                     break
-                try:
-                    trad = GoogleTranslator(source=src, target=dst).translate(texto)
-                except Exception:
+                trad = self.traducir(texto, src, dst)
+                if not trad:
                     time.sleep(0.8 * (intento + 1))
             log("   🌎 " + (trad or "[sin traducción — revisa tu internet]"))
             self.app.cola_ui.put(("trad", n, hora, trad or "[sin traducción — revisa tu internet]"))
